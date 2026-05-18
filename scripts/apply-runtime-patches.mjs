@@ -28,7 +28,20 @@ function ensureImport(content, importLine) {
   if (content.includes(importLine)) return content;
   const lines = content.split('\n');
   let insertAt = 0;
-  while (insertAt < lines.length && lines[insertAt].startsWith('import ')) insertAt += 1;
+  let depth = 0;
+  while (insertAt < lines.length) {
+    const line = lines[insertAt];
+    const trimmed = line.trim();
+    // Count braces to track multi-line import blocks
+    for (const ch of line) {
+      if (ch === '{') depth += 1;
+      else if (ch === '}') depth -= 1;
+    }
+    // Only advance while we are inside an import statement
+    const isImportLine = trimmed.startsWith('import ') || depth > 0 || (depth === 0 && trimmed === '');
+    if (!trimmed.startsWith('import ') && depth === 0 && trimmed !== '') break;
+    insertAt += 1;
+  }
   lines.splice(insertAt, 0, importLine);
   return lines.join('\n');
 }
@@ -39,7 +52,17 @@ function ensureRouteMaxDuration(content, seconds) {
   }
   const lines = content.split('\n');
   let insertAt = 0;
-  while (insertAt < lines.length && lines[insertAt].startsWith('import ')) insertAt += 1;
+  let depth = 0;
+  while (insertAt < lines.length) {
+    const line = lines[insertAt];
+    const trimmed = line.trim();
+    for (const ch of line) {
+      if (ch === '{') depth += 1;
+      else if (ch === '}') depth -= 1;
+    }
+    if (!trimmed.startsWith('import ') && depth === 0 && trimmed !== '') break;
+    insertAt += 1;
+  }
   lines.splice(insertAt, 0, '', `export const maxDuration = ${seconds};`);
   return lines.join('\n');
 }
@@ -145,7 +168,7 @@ patch('src/app/api/warroom/chat/route.ts', (content) => {
   next = next.replace(/sessionId: session\.id,/g, 'sessionId: persisted.sessionId,');
   next = next.replace(/userMessageId: userMessage\.id,/g, 'userMessageId: persisted.userMessageId,');
   next = next.replace(/assistantMessageId: assistantMessage\.id,/g, 'assistantMessageId: persisted.assistantMessageId,');
-  next = next.replace(/sources: sourceRecords\.map\(\(s\) => \(\{[\s\S]*?\}\)\),/m,
+  next = next.replace(/sources: sourceRecords\.map\(\(s\) => \({[\s\S]*?\}\)\),/m,
     'sources: persisted.sources,');
   return next;
 });
