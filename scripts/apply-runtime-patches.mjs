@@ -24,28 +24,64 @@ function patch(rel, transform) {
   else console.log(`[runtime-patches] no changes ${rel}`);
 }
 
+/**
+ * Insert importLine after the last import block in content.
+ *
+ * Strategy:
+ *  1. Skip any leading 'use client' / 'use server' directives.
+ *  2. Walk lines, tracking brace depth so multi-line import { ... }
+ *     blocks are treated as a single unit.
+ *  3. Only break out of the loop when depth === 0 AND the line is
+ *     neither an import statement nor a blank line — i.e. we have
+ *     truly left the import section.
+ */
 function ensureImport(content, importLine) {
   if (content.includes(importLine)) return content;
   const lines = content.split('\n');
   let insertAt = 0;
   let depth = 0;
+
   while (insertAt < lines.length) {
     const line = lines[insertAt];
     const trimmed = line.trim();
-    // Count braces to track multi-line import blocks
+
+    // Skip 'use client' / 'use server' directives at the top
+    if (trimmed === "'use client'" || trimmed === '"use client"' ||
+        trimmed === "'use server'" || trimmed === '"use server"') {
+      insertAt += 1;
+      continue;
+    }
+
+    // Count braces BEFORE deciding whether to break
     for (const ch of line) {
       if (ch === '{') depth += 1;
       else if (ch === '}') depth -= 1;
     }
-    // Only advance while we are inside an import statement
-    const isImportLine = trimmed.startsWith('import ') || depth > 0 || (depth === 0 && trimmed === '');
-    if (!trimmed.startsWith('import ') && depth === 0 && trimmed !== '') break;
-    insertAt += 1;
+
+    // We are still inside a multi-line import block — keep going
+    if (depth > 0) {
+      insertAt += 1;
+      continue;
+    }
+
+    // depth === 0 here — safe to check whether this line is part of imports
+    if (trimmed.startsWith('import ') || trimmed === '') {
+      insertAt += 1;
+      continue;
+    }
+
+    // Non-import, non-blank line with depth === 0 — insert before this line
+    break;
   }
+
   lines.splice(insertAt, 0, importLine);
   return lines.join('\n');
 }
 
+/**
+ * Ensure `export const maxDuration = N;` exists after the import block.
+ * Uses the same robust depth-tracking logic as ensureImport.
+ */
 function ensureRouteMaxDuration(content, seconds) {
   if (/export\s+const\s+maxDuration\s*=/.test(content)) {
     return content.replace(/export\s+const\s+maxDuration\s*=\s*\d+\s*;?/g, `export const maxDuration = ${seconds};`);
@@ -53,16 +89,35 @@ function ensureRouteMaxDuration(content, seconds) {
   const lines = content.split('\n');
   let insertAt = 0;
   let depth = 0;
+
   while (insertAt < lines.length) {
     const line = lines[insertAt];
     const trimmed = line.trim();
+
+    if (trimmed === "'use client'" || trimmed === '"use client"' ||
+        trimmed === "'use server'" || trimmed === '"use server"') {
+      insertAt += 1;
+      continue;
+    }
+
     for (const ch of line) {
       if (ch === '{') depth += 1;
       else if (ch === '}') depth -= 1;
     }
-    if (!trimmed.startsWith('import ') && depth === 0 && trimmed !== '') break;
-    insertAt += 1;
+
+    if (depth > 0) {
+      insertAt += 1;
+      continue;
+    }
+
+    if (trimmed.startsWith('import ') || trimmed === '') {
+      insertAt += 1;
+      continue;
+    }
+
+    break;
   }
+
   lines.splice(insertAt, 0, '', `export const maxDuration = ${seconds};`);
   return lines.join('\n');
 }
