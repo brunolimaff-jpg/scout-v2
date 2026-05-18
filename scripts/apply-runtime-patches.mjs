@@ -53,7 +53,26 @@ function patchLLMRoute(content) {
 
 patch('src/app/api/scout/investigate/route.ts', (content) => {
   let next = patchLLMRoute(content);
+  next = ensureImport(next, "import { safeScoutCreate, safeScoutUpdate, safePortaScoreCreate } from '@/lib/runtime-store';");
   next = ensureRouteMaxDuration(next, 600);
+
+  // SQLite/Prisma can fail on Vercel without external persistence. Keep demo functional.
+  next = next.replace(
+    /const investigation = await db\.scoutInvestigation\.create\(\{\s*data: \{ companyName: trimmedName, cnpj: cnpj\?\.trim\(\) \|\| null, status: 'investigating' \},\s*\}\);/m,
+    "const investigation = await safeScoutCreate(db, { companyName: trimmedName, cnpj: cnpj?.trim() || null, status: 'investigating' });"
+  );
+
+  next = next.replace(
+    /updatedInvestigation = await db\.scoutInvestigation\.update\(\{\s*where: \{ id: investigation\.id \},\s*data: \{/m,
+    "updatedInvestigation = await safeScoutUpdate(db, investigation.id, {"
+  );
+  next = next.replace(/\n\s*\},\s*\n\s*\}\);\s*\n\s*\} catch \(dbSaveError\)/m, "\n              });\n          } catch (dbSaveError)");
+
+  next = next.replace(
+    /portaScore = await db\.portaScore\.create\(\{\s*data: \{/m,
+    "portaScore = await safePortaScoreCreate(db, {"
+  );
+  next = next.replace(/\n\s*\},\s*\n\s*\}\);\s*\n\s*\}/m, "\n              });\n          }");
 
   // Server heartbeat should keep the connection alive without creating anxious warning copy.
   next = next.replace(/\/\/ Heartbeat: send warning if >10s between events[\s\S]*?\}, 10000\);/m, `// Heartbeat: keep the SSE connection alive. This is NOT a warning and not progress.
@@ -76,18 +95,52 @@ patch('src/app/api/scout/investigate/route.ts', (content) => {
   next = next
     .replace(/Pipeline em andamento — aguardando resposta do provedor\.{3}/g, 'Investigação ativa — validando fontes e evidências.')
     .replace(/continuando com outras fontes\.\.\./g, 'tentando outras fontes reais...')
-    .replace(/Busca competitiva falhou, continuando sem dados de concorrência\./g, 'Busca competitiva falhou; nenhum sinal competitivo será exibido sem fonte.');
+    .replace(/Busca competitiva falhou, continuando sem dados de concorrência\./g, 'Busca competitiva falhou; nenhum sinal competitivo será exibido sem fonte.')
+    .replace(/Erro ao salvar a investigação\. Tente novamente\./g, 'A análise foi gerada, mas não consegui persistir o histórico. Resultado não foi transformado em falso sucesso.');
 
   return next;
 });
 
 patch('src/app/api/warroom/chat/route.ts', (content) => {
   let next = patchLLMRoute(content);
+  next = ensureImport(next, "import { safeWarRoomPersist } from '@/lib/runtime-store';");
   next = ensureRouteMaxDuration(next, 300);
   next = next.replace(/const pageData = await withTimeout\(zai\.functions\.invoke\('page_reader', \{ url \}\), 15000\);/g,
     "const pageData = await withTimeout(zai.functions.invoke('page_reader', { url }), 60_000);");
   next = next.replace('Não foi possível gerar uma resposta no momento. Por favor, tente novamente.',
     'Não consegui gerar uma resposta com base documental suficiente neste momento. Tente informar o produto, módulo, rotina ou erro com mais contexto.');
+
+  // Replace the DB persistence block with a safe Prisma-first, memory-fallback helper.
+  next = next.replace(/\/\/ Step 9: Save to database[\s\S]*?\/\/ Step 10: Return structured response\n\s*return NextResponse\.json\(\{/m, `// Step 9: Save to database or memory fallback
+    const safeProduct = typeof keyTerms.product === 'string' ? keyTerms.product : null;
+    const safeModule = typeof keyTerms.module === 'string' ? keyTerms.module : null;
+    const safeIntent = typeof intent === 'string' ? intent : null;
+    const safeConfidence = (typeof confidence === 'string' && ['high', 'medium', 'low'].includes(confidence)) ? confidence : null;
+
+    const persisted = await safeWarRoomPersist(db, {
+      sessionId,
+      message,
+      answer,
+      intent: safeIntent,
+      confidence: safeConfidence,
+      product: safeProduct,
+      module: safeModule,
+      sources: pageContents.map((page, i) => ({
+        title: page.title,
+        url: page.url,
+        snippet: page.content.slice(0, 500),
+        relevance: 1 - i * 0.15,
+      })),
+    });
+
+    // Step 10: Return structured response
+    return NextResponse.json({`);
+
+  next = next.replace(/sessionId: session\.id,/g, 'sessionId: persisted.sessionId,');
+  next = next.replace(/userMessageId: userMessage\.id,/g, 'userMessageId: persisted.userMessageId,');
+  next = next.replace(/assistantMessageId: assistantMessage\.id,/g, 'assistantMessageId: persisted.assistantMessageId,');
+  next = next.replace(/sources: sourceRecords\.map\(\(s\) => \(\{[\s\S]*?\}\)\),/m,
+    'sources: persisted.sources,');
   return next;
 });
 
