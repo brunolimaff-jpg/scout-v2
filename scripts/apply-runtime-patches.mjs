@@ -66,13 +66,19 @@ patch('src/app/api/scout/investigate/route.ts', (content) => {
     /updatedInvestigation = await db\.scoutInvestigation\.update\(\{\s*where: \{ id: investigation\.id \},\s*data: \{/m,
     "updatedInvestigation = await safeScoutUpdate(db, investigation.id, {"
   );
-  next = next.replace(/\n\s*\},\s*\n\s*\}\);\s*\n\s*\} catch \(dbSaveError\)/m, "\n              });\n          } catch (dbSaveError)");
+  next = next.replace(
+    /qualityCheck: JSON\.stringify\(qc\),\s*\n\s*\},\s*\n\s*\}\);/m,
+    "qualityCheck: JSON.stringify(qc),\n              });"
+  );
 
   next = next.replace(
     /portaScore = await db\.portaScore\.create\(\{\s*data: \{/m,
     "portaScore = await safePortaScoreCreate(db, {"
   );
-  next = next.replace(/\n\s*\},\s*\n\s*\}\);\s*\n\s*\}/m, "\n              });\n          }");
+  next = next.replace(
+    /notes: JSON\.stringify\(portaResult\.notes\),\s*\n\s*\},\s*\n\s*\}\);/m,
+    "notes: JSON.stringify(portaResult.notes),\n              });"
+  );
 
   // Server heartbeat should keep the connection alive without creating anxious warning copy.
   next = next.replace(/\/\/ Heartbeat: send warning if >10s between events[\s\S]*?\}, 10000\);/m, `// Heartbeat: keep the SSE connection alive. This is NOT a warning and not progress.
