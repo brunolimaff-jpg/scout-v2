@@ -70,17 +70,23 @@ model DocumentationChunk {
 // ============================================
 
 model ScoutInvestigation {
-  id          String   @id @default(cuid())
-  companyName String
-  cnpj        String?
-  sector      String?  // "agro" | "construction" | "retail" | "industry" | "services" | "logistics"
-  status      String   @default("pending") // "pending" | "investigating" | "completed" | "failed"
-  summary     String?
-  rawData     String?  // JSON string with all collected data
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
-  portaScore  PortaScore?
-  crmAccount  CrmAccount?
+  id              String   @id @default(cuid())
+  companyName     String
+  cnpj            String?
+  sector          String?  // "agro" | "construction" | "retail" | "industry" | "services" | "logistics"
+  subSector       String?  // Agro: "produtor_larga_escala" | "cooperativa" | "revenda_insumos" | "cerealista" | "trading" | "agroindustria" | "pecuaria" | "usina" | "regenerativa" | "mista"
+  status          String   @default("pending") // "pending" | "investigating" | "completed" | "failed"
+  summary         String?  // Fact-based executive summary
+  rawData         String?  // JSON string with all collected data (searches, snippets, sources)
+  evidences       String?  // JSON array: [{ type: "fact"|"hypothesis"|"recommendation"|"gap", claim, source, confidence }]
+  classification  String?  // JSON: { sector, subSector, companyType, scale, complexity }
+  commercialThesis String? // JSON: { thesis, seniorModules, painPoints, decisionMakers, risks, nextSteps }
+  sources         String?  // JSON array: [{ title, url, snippet, type }]
+  qualityCheck    String?  // JSON: { passed, issues[], rewritten }
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  portaScore      PortaScore?
+  crmAccount      CrmAccount?
 }
 
 model PortaScore {
@@ -93,7 +99,8 @@ model PortaScore {
   adocao          Float    @default(0) // A - Adoption readiness (weight 0.25)
   total           Float    @default(0) // Weighted total
   sector          String?
-  notes           String?  // JSON with per-dimension notes
+  subSector       String?
+  notes           String?  // JSON: per-dimension { score, justification, evidences[], confidence, gaps[], penalty }
   createdAt       DateTime @default(now())
   updatedAt       DateTime @updatedAt
   investigation   ScoutInvestigation @relation(fields: [investigationId], references: [id], onDelete: Cascade)
