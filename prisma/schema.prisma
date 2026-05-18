@@ -1,0 +1,139 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// ============================================
+// WAR ROOM - Senior Documentation Intelligence
+// ============================================
+
+model WarRoomSession {
+  id        String   @id @default(cuid())
+  title     String   @default("Nova Sessão")
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  messages  WarRoomMessage[]
+}
+
+model WarRoomMessage {
+  id        String   @id @default(cuid())
+  sessionId String
+  role      String   // "user" | "assistant"
+  content   String
+  intent    String?  // "documentation" | "error" | "config" | "step_by_step" | "concept" | "integration" | "business_rule" | "unrelated"
+  confidence String? // "high" | "medium" | "low"
+  product   String?  // Detected Senior product
+  module    String?  // Detected module
+  createdAt DateTime @default(now())
+  session   WarRoomSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  sources   WarRoomSource[]
+}
+
+model WarRoomSource {
+  id        String   @id @default(cuid())
+  messageId String
+  title     String
+  url       String
+  snippet   String   @default("")
+  relevance Float    @default(0)
+  consultedAt DateTime @default(now())
+  message   WarRoomMessage @relation(fields: [messageId], references: [id], onDelete: Cascade)
+}
+
+model DocumentationPage {
+  id          String   @id @default(cuid())
+  url         String   @unique
+  title       String
+  product     String?
+  module      String?
+  version     String?
+  content     String   // Extracted plain text
+  indexedAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  chunks      DocumentationChunk[]
+}
+
+model DocumentationChunk {
+  id       String   @id @default(cuid())
+  pageId   String
+  content  String
+  index    Int      // Chunk order within page
+  page     DocumentationPage @relation(fields: [pageId], references: [id], onDelete: Cascade)
+}
+
+// ============================================
+// SCOUT - Company Investigation
+// ============================================
+
+model ScoutInvestigation {
+  id          String   @id @default(cuid())
+  companyName String
+  cnpj        String?
+  sector      String?  // "agro" | "construction" | "retail" | "industry" | "services" | "logistics"
+  status      String   @default("pending") // "pending" | "investigating" | "completed" | "failed"
+  summary     String?
+  rawData     String?  // JSON string with all collected data
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  portaScore  PortaScore?
+  crmAccount  CrmAccount?
+}
+
+model PortaScore {
+  id              String   @id @default(cuid())
+  investigationId String   @unique
+  porte           Float    @default(0) // P - Company size (weight 0.10)
+  operacao        Float    @default(0) // O - Operations (weight 0.25)
+  retorno         Float    @default(0) // R - ROI potential (weight 0.10)
+  tecnologia      Float    @default(0) // T - Technology (weight 0.30)
+  adocao          Float    @default(0) // A - Adoption readiness (weight 0.25)
+  total           Float    @default(0) // Weighted total
+  sector          String?
+  notes           String?  // JSON with per-dimension notes
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  investigation   ScoutInvestigation @relation(fields: [investigationId], references: [id], onDelete: Cascade)
+}
+
+// ============================================
+// CRM - Account Management
+// ============================================
+
+model CrmAccount {
+  id              String   @id @default(cuid())
+  investigationId String?  @unique
+  companyName     String
+  cnpj            String?
+  sector          String?
+  contactName     String?
+  contactEmail    String?
+  contactPhone    String?
+  stage           String   @default("lead") // "lead" | "qualified" | "proposal" | "negotiation" | "closed_won" | "closed_lost"
+  nextStep        String?
+  notes           String?
+  potentialValue  Float?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  investigation   ScoutInvestigation? @relation(fields: [investigationId], references: [id])
+}
+
+// ============================================
+// RADAR - Competitive Intelligence
+// ============================================
+
+model RadarEntry {
+  id          String   @id @default(cuid())
+  title       String
+  category    String   // "competitor" | "market_trend" | "regulation" | "technology" | "opportunity"
+  sector      String?
+  summary     String
+  source      String?
+  sourceUrl   String?
+  relevance   Float    @default(0)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
