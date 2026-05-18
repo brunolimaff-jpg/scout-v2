@@ -69,7 +69,7 @@ export default function Home() {
             </div>
             <div className="hidden sm:block">
               <h1 className="text-sm font-bold leading-none">SENIOR SCOUT 360</h1>
-              <p className="text-[10px] text-muted-foreground">Inteligência de Documentação</p>
+              <p className="text-[10px] text-muted-foreground">Inteligência Comercial</p>
             </div>
             <h1 className="sm:hidden text-sm font-bold">SS360</h1>
           </div>
@@ -140,7 +140,7 @@ export default function Home() {
       {/* Footer */}
       <footer className="border-t bg-muted/30 px-4 py-2 mt-auto">
         <p className="text-[10px] text-muted-foreground text-center">
-          Senior Scout 360 v3.0 · Doc Intel ·{' '}
+          Senior Scout 360 v3.0 · Inteligência Comercial ·{' '}
           <a
             href="https://documentacao.senior.com.br"
             target="_blank"

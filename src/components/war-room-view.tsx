@@ -4,9 +4,16 @@ import { useState, useEffect, useRef, useCallback } from 'react'
 import { Button } from '@/components/ui/button'
 import { Textarea } from '@/components/ui/textarea'
 import { Badge } from '@/components/ui/badge'
-import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
+import { Card, CardContent } from '@/components/ui/card'
 import { ScrollArea } from '@/components/ui/scroll-area'
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible'
+import {
+  ChatLoadingIndicator,
+  WARROOM_STAGES,
+  WARROOM_EMPTY_STATES,
+  EmptyState,
+  useEstimatedProgress,
+} from '@/components/investigation-loader'
 import {
   Send,
   Plus,
@@ -17,6 +24,11 @@ import {
   BookOpen,
   Trash2,
   Sparkles,
+  Target,
+  MessageCircle,
+  Lightbulb,
+  FileSearch,
+  ArrowRight,
 } from 'lucide-react'
 import ReactMarkdown from 'react-markdown'
 import { toast } from 'sonner'
@@ -55,13 +67,23 @@ interface WarRoomSession {
 
 const INTENT_LABELS: Record<string, string> = {
   documentation: 'Documentação',
-  error: 'Erro',
+  error: 'Erro do Cliente',
   config: 'Configuração',
   step_by_step: 'Passo a Passo',
   concept: 'Conceito',
   integration: 'Integração',
   business_rule: 'Regra de Negócio',
+  commercial: 'Argumento Comercial',
+  client_doubt: 'Dúvida do Cliente',
   unrelated: 'Não Relacionado',
+}
+
+const INTENT_ICONS: Record<string, React.ElementType> = {
+  documentation: FileSearch,
+  error: MessageCircle,
+  config: Lightbulb,
+  commercial: Target,
+  client_doubt: MessageCircle,
 }
 
 const CONFIDENCE_LABELS: Record<string, { label: string; color: string }> = {
@@ -70,15 +92,44 @@ const CONFIDENCE_LABELS: Record<string, { label: string; color: string }> = {
   low: { label: 'Baixa', color: 'bg-rose-100 text-rose-800 dark:bg-rose-900/30 dark:text-rose-400' },
 }
 
-const SUGGESTED_QUESTIONS = [
-  'Como configurar uma integração no Senior?',
-  'Onde encontro a documentação de determinado módulo?',
-  'O que significa este erro?',
-  'Quais são os pré-requisitos desta rotina?',
-  'Como funciona este processo no sistema?',
-  'Qual tela ou parâmetro devo verificar?',
-  'Me explique esta documentação em linguagem simples.',
-  'Compare duas páginas da documentação e me diga a diferença.',
+// Commercial-focused suggested questions organized by mode
+const SUGGESTED_MODES = [
+  {
+    id: 'understand',
+    label: 'Entender',
+    icon: FileSearch,
+    color: 'text-emerald-600 dark:text-emerald-400 border-emerald-200 dark:border-emerald-800 hover:bg-emerald-50 dark:hover:bg-emerald-950/30',
+    questions: [
+      'Explique esta rotina em linguagem de vendedor',
+      'O que este módulo faz na prática?',
+      'Resuma essa integração em 5 pontos',
+      'Onde encontro a documentação oficial sobre isso?',
+    ],
+  },
+  {
+    id: 'sell',
+    label: 'Vender',
+    icon: Target,
+    color: 'text-teal-600 dark:text-teal-400 border-teal-200 dark:border-teal-800 hover:bg-teal-50 dark:hover:bg-teal-950/30',
+    questions: [
+      'Quais dores este módulo resolve?',
+      'Transforme essa funcionalidade em argumento comercial',
+      'O que devo perguntar antes de oferecer essa solução?',
+      'Monte perguntas para diagnosticar o cliente',
+    ],
+  },
+  {
+    id: 'respond',
+    label: 'Responder Cliente',
+    icon: MessageCircle,
+    color: 'text-amber-600 dark:text-amber-400 border-amber-200 dark:border-amber-800 hover:bg-amber-50 dark:hover:bg-amber-950/30',
+    questions: [
+      'Me ajude a responder uma dúvida do cliente',
+      'Quais pré-requisitos preciso validar?',
+      'Qual documentação posso enviar para o cliente?',
+      'O que significa esse erro que o cliente mandou?',
+    ],
+  },
 ]
 
 // ---------- Component ----------
@@ -92,10 +143,22 @@ export function WarRoomView() {
   const [isLoadingSession, setIsLoadingSession] = useState(false)
   const [showSessionList, setShowSessionList] = useState(false)
   const [expandedSources, setExpandedSources] = useState<Record<string, boolean>>({})
+  const [activeMode, setActiveMode] = useState<string>('understand')
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLTextAreaElement>(null)
+  const abortRef = useRef<AbortController | null>(null)
 
-  // Load sessions
+  // Loading progress (estimated for War Room)
+  const {
+    stageStatuses,
+    currentStageId,
+    tickerItems,
+    elapsedSeconds,
+    isCancelling,
+    completeAll,
+    cancel: cancelProgress,
+  } = useEstimatedProgress(WARROOM_STAGES, isLoading, () => {})
+
   const loadSessions = useCallback(async () => {
     try {
       const res = await fetch('/api/warroom/sessions')
@@ -103,80 +166,50 @@ export function WarRoomView() {
         const data = await res.json()
         setSessions(data.sessions || [])
       }
-    } catch {
-      // silent
-    }
+    } catch { /* */ }
   }, [])
 
-  useEffect(() => {
-    loadSessions()
-  }, [loadSessions])
+  useEffect(() => { loadSessions() }, [loadSessions])
 
-  // Load session messages
   const loadSession = useCallback(async (sessionId: string) => {
     setIsLoadingSession(true)
     try {
       const res = await fetch(`/api/warroom/sessions/${sessionId}`)
       if (res.ok) {
         const data = await res.json()
-        setMessages(
-          (data.messages || []).map((m: WarRoomMessage) => ({
-            ...m,
-            sources: m.sources || [],
-          }))
-        )
+        setMessages((data.messages || []).map((m: WarRoomMessage) => ({ ...m, sources: m.sources || [] })))
         setCurrentSessionId(sessionId)
       }
-    } catch {
-      toast.error('Erro ao carregar sessão')
-    } finally {
-      setIsLoadingSession(false)
-    }
+    } catch { toast.error('Erro ao carregar sessão') }
+    finally { setIsLoadingSession(false) }
   }, [])
 
-  // Auto-scroll to bottom
-  useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
-  }, [messages])
+  useEffect(() => { messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' }) }, [messages])
 
-  // Create new session
   const createNewSession = async () => {
     try {
-      const res = await fetch('/api/warroom/sessions', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ title: 'Nova Sessão' }),
-      })
+      const res = await fetch('/api/warroom/sessions', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ title: 'Nova Sessão' }) })
       if (res.ok) {
         const session = await res.json()
-        setSessions((prev) => [session, ...prev])
+        setSessions(prev => [session, ...prev])
         setCurrentSessionId(session.id)
         setMessages([])
         setShowSessionList(false)
       }
-    } catch {
-      toast.error('Erro ao criar sessão')
-    }
+    } catch { toast.error('Erro ao criar sessão') }
   }
 
-  // Delete session
   const deleteSession = async (sessionId: string) => {
     try {
       const res = await fetch(`/api/warroom/sessions/${sessionId}`, { method: 'DELETE' })
       if (res.ok) {
-        setSessions((prev) => prev.filter((s) => s.id !== sessionId))
-        if (currentSessionId === sessionId) {
-          setCurrentSessionId(null)
-          setMessages([])
-        }
+        setSessions(prev => prev.filter(s => s.id !== sessionId))
+        if (currentSessionId === sessionId) { setCurrentSessionId(null); setMessages([]) }
         toast.success('Sessão excluída')
       }
-    } catch {
-      toast.error('Erro ao excluir sessão')
-    }
+    } catch { toast.error('Erro ao excluir sessão') }
   }
 
-  // Send message
   const sendMessage = async (messageText?: string) => {
     const text = (messageText || input).trim()
     if (!text || isLoading) return
@@ -184,7 +217,6 @@ export function WarRoomView() {
     setInput('')
     setIsLoading(true)
 
-    // Add user message immediately
     const tempUserMsg: WarRoomMessage = {
       id: `temp-user-${Date.now()}`,
       role: 'user',
@@ -192,31 +224,31 @@ export function WarRoomView() {
       sources: [],
       createdAt: new Date().toISOString(),
     }
-    setMessages((prev) => [...prev, tempUserMsg])
+    setMessages(prev => [...prev, tempUserMsg])
+
+    const abortController = new AbortController()
+    abortRef.current = abortController
 
     try {
       const res = await fetch('/api/warroom/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          sessionId: currentSessionId || undefined,
-          message: text,
-        }),
+        body: JSON.stringify({ sessionId: currentSessionId || undefined, message: text }),
+        signal: abortController.signal,
       })
 
-      if (!res.ok) {
-        throw new Error('Failed to send message')
-      }
+      if (!res.ok) throw new Error('Failed to send message')
 
       const data = await res.json()
 
-      // Update session ID if new
+      // Complete loading progress
+      completeAll()
+
       if (!currentSessionId && data.sessionId) {
         setCurrentSessionId(data.sessionId)
         await loadSessions()
       }
 
-      // Add assistant message
       const assistantMsg: WarRoomMessage = {
         id: data.assistantMessageId || `temp-asst-${Date.now()}`,
         role: 'assistant',
@@ -229,22 +261,18 @@ export function WarRoomView() {
         createdAt: new Date().toISOString(),
       }
 
-      // Replace temp user msg with real one and add assistant
-      setMessages((prev) => [
-        ...prev.filter((m) => m.id !== tempUserMsg.id),
-        {
-          ...tempUserMsg,
-          id: data.userMessageId || tempUserMsg.id,
-          intent: data.intent,
-          product: data.keyTerms?.product,
-          module: data.keyTerms?.module,
-        },
+      setMessages(prev => [
+        ...prev.filter(m => m.id !== tempUserMsg.id),
+        { ...tempUserMsg, id: data.userMessageId || tempUserMsg.id, intent: data.intent, product: data.keyTerms?.product, module: data.keyTerms?.module },
         assistantMsg,
       ])
-    } catch {
-      toast.error('Erro ao enviar mensagem. Tente novamente.')
-      // Remove temp user message on error
-      setMessages((prev) => prev.filter((m) => m.id !== tempUserMsg.id))
+    } catch (err) {
+      if (err instanceof Error && err.name === 'AbortError') {
+        toast.info('Consulta cancelada')
+      } else {
+        toast.error('Erro ao consultar. Tente novamente.')
+      }
+      setMessages(prev => prev.filter(m => m.id !== tempUserMsg.id))
     } finally {
       setIsLoading(false)
       inputRef.current?.focus()
@@ -252,17 +280,19 @@ export function WarRoomView() {
   }
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
-    if (e.key === 'Enter' && !e.shiftKey) {
-      e.preventDefault()
-      sendMessage()
-    }
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage() }
   }
 
   const toggleSources = (messageId: string) => {
-    setExpandedSources((prev) => ({ ...prev, [messageId]: !prev[messageId] }))
+    setExpandedSources(prev => ({ ...prev, [messageId]: !prev[messageId] }))
   }
 
-  const currentSession = sessions.find((s) => s.id === currentSessionId)
+  const cancelLoading = () => {
+    if (abortRef.current) abortRef.current.abort()
+    cancelProgress()
+  }
+
+  const currentSession = sessions.find(s => s.id === currentSessionId)
 
   return (
     <div className="flex flex-col h-full">
@@ -276,7 +306,7 @@ export function WarRoomView() {
             <div>
               <h2 className="text-lg font-bold">War Room</h2>
               <p className="text-xs text-muted-foreground">
-                Inteligência de Documentação Senior
+                Apoio Comercial Senior
               </p>
             </div>
           </div>
@@ -284,22 +314,16 @@ export function WarRoomView() {
             <Badge variant="outline" className="text-xs hidden sm:flex">
               documentacao.senior.com.br
             </Badge>
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() => setShowSessionList(!showSessionList)}
-            >
-              <MessageSquare className="h-4 w-4 mr-1" />
-              <span className="hidden sm:inline">Sessões</span>
+            <Button variant="outline" size="sm" onClick={() => setShowSessionList(!showSessionList)}>
+              <MessageSquare className="h-4 w-4 mr-1" /><span className="hidden sm:inline">Sessões</span>
             </Button>
             <Button variant="outline" size="sm" onClick={createNewSession}>
-              <Plus className="h-4 w-4 mr-1" />
-              <span className="hidden sm:inline">Nova</span>
+              <Plus className="h-4 w-4 mr-1" /><span className="hidden sm:inline">Nova</span>
             </Button>
           </div>
         </div>
         <p className="text-xs text-muted-foreground mt-2">
-          Pergunte sobre produtos, módulos, configurações, integrações e documentação Senior.
+          Consulte a documentação oficial e transforme rotinas, módulos e integrações em respostas claras para clientes.
         </p>
       </div>
 
@@ -310,36 +334,20 @@ export function WarRoomView() {
             <div className="p-3">
               <h3 className="text-sm font-semibold mb-2">Sessões Recentes</h3>
               <div className="space-y-1.5">
-                {sessions.length === 0 && (
-                  <p className="text-xs text-muted-foreground py-4 text-center">
-                    Nenhuma sessão ainda.
-                  </p>
-                )}
-                {sessions.map((session) => (
+                {sessions.length === 0 && <p className="text-xs text-muted-foreground py-4 text-center">Nenhuma sessão ainda.</p>}
+                {sessions.map(session => (
                   <div
                     key={session.id}
                     className={`group flex items-center justify-between p-2 rounded-md cursor-pointer text-sm transition-colors ${
-                      session.id === currentSessionId
-                        ? 'bg-emerald-100 dark:bg-emerald-900/30 font-medium'
-                        : 'hover:bg-muted'
+                      session.id === currentSessionId ? 'bg-emerald-100 dark:bg-emerald-900/30 font-medium' : 'hover:bg-muted'
                     }`}
                     onClick={() => loadSession(session.id)}
                   >
                     <div className="flex-1 min-w-0">
                       <p className="truncate text-xs">{session.title}</p>
-                      <p className="text-[10px] text-muted-foreground">
-                        {session.messageCount} msgs
-                      </p>
+                      <p className="text-[10px] text-muted-foreground">{session.messageCount} msgs</p>
                     </div>
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      className="opacity-0 group-hover:opacity-100 h-6 w-6 p-0"
-                      onClick={(e) => {
-                        e.stopPropagation()
-                        deleteSession(session.id)
-                      }}
-                    >
+                    <Button variant="ghost" size="sm" className="opacity-0 group-hover:opacity-100 h-6 w-6 p-0" onClick={(e) => { e.stopPropagation(); deleteSession(session.id) }}>
                       <Trash2 className="h-3 w-3 text-muted-foreground" />
                     </Button>
                   </div>
@@ -351,7 +359,6 @@ export function WarRoomView() {
 
         {/* Chat Area */}
         <div className="flex-1 flex flex-col">
-          {/* Session Title */}
           {currentSession && (
             <div className="px-4 py-1.5 border-b bg-muted/30 flex items-center gap-2">
               <Sparkles className="h-3 w-3 text-emerald-500" />
@@ -368,29 +375,69 @@ export function WarRoomView() {
                     <div className="inline-flex p-4 bg-emerald-100 dark:bg-emerald-900/30 rounded-full">
                       <BookOpen className="h-8 w-8 text-emerald-600 dark:text-emerald-400" />
                     </div>
-                    <h3 className="text-lg font-semibold">War Room — Documentação Senior</h3>
+                    <h3 className="text-lg font-semibold">War Room — Apoio Comercial Senior</h3>
                     <p className="text-sm text-muted-foreground max-w-md mx-auto">
-                      Faça perguntas sobre a documentação Senior e receba respostas com fontes,
-                      confiança e lacunas identificadas.
+                      Pergunte sobre soluções Senior, módulos, rotinas, integrações e dúvidas de clientes. O War Room consulta a documentação oficial e traduz em resposta prática para vendas.
                     </p>
                   </div>
 
-                  {/* Suggested Questions */}
-                  <div className="space-y-2">
-                    <p className="text-xs font-medium text-muted-foreground text-center">
-                      Perguntas sugeridas
-                    </p>
-                    <div className="flex flex-wrap gap-2 justify-center">
-                      {SUGGESTED_QUESTIONS.map((q, i) => (
+                  {/* Mode selector + suggestions */}
+                  <div className="space-y-4">
+                    <div className="flex items-center justify-center gap-2">
+                      {SUGGESTED_MODES.map(mode => {
+                        const Icon = mode.icon
+                        return (
+                          <button
+                            key={mode.id}
+                            onClick={() => setActiveMode(mode.id)}
+                            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-medium border transition-colors ${
+                              activeMode === mode.id ? mode.color : 'text-muted-foreground border-muted hover:border-foreground/20'
+                            }`}
+                          >
+                            <Icon className="h-3.5 w-3.5" />
+                            {mode.label}
+                          </button>
+                        )
+                      })}
+                    </div>
+
+                    {SUGGESTED_MODES.filter(m => m.id === activeMode).map(mode => (
+                      <div key={mode.id} className="flex flex-wrap gap-2 justify-center">
+                        {mode.questions.map((q, i) => (
+                          <button
+                            key={i}
+                            onClick={() => sendMessage(q)}
+                            className="text-xs px-3 py-1.5 rounded-full border bg-background hover:bg-emerald-50 dark:hover:bg-emerald-950/30 hover:border-emerald-300 dark:hover:border-emerald-700 transition-colors text-left"
+                          >
+                            {q}
+                          </button>
+                        ))}
+                      </div>
+                    ))}
+                  </div>
+
+                  {/* Quick action cards */}
+                  <div className="grid grid-cols-2 sm:grid-cols-3 gap-2 max-w-lg mx-auto">
+                    {[
+                      { icon: FileSearch, label: 'Entender uma solução' },
+                      { icon: MessageCircle, label: 'Responder dúvida de cliente' },
+                      { icon: Target, label: 'Preparar reunião' },
+                      { icon: BookOpen, label: 'Encontrar documentação' },
+                      { icon: Lightbulb, label: 'Argumento comercial' },
+                      { icon: ArrowRight, label: 'Validar pré-requisitos' },
+                    ].map((item, i) => {
+                      const Icon = item.icon
+                      return (
                         <button
                           key={i}
-                          onClick={() => sendMessage(q)}
-                          className="text-xs px-3 py-1.5 rounded-full border bg-background hover:bg-emerald-50 dark:hover:bg-emerald-950/30 hover:border-emerald-300 dark:hover:border-emerald-700 transition-colors text-left"
+                          className="flex items-center gap-2 p-2.5 rounded-lg border bg-background hover:bg-emerald-50/50 dark:hover:bg-emerald-950/20 transition-colors text-left"
+                          onClick={() => setInput(item.label)}
                         >
-                          {q}
+                          <Icon className="h-4 w-4 text-emerald-500 flex-shrink-0" />
+                          <span className="text-[11px] text-muted-foreground">{item.label}</span>
                         </button>
-                      ))}
-                    </div>
+                      )
+                    })}
                   </div>
                 </div>
               )}
@@ -401,19 +448,9 @@ export function WarRoomView() {
                 </div>
               )}
 
-              {messages.map((msg) => (
-                <div
-                  key={msg.id}
-                  className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}
-                >
-                  <div
-                    className={`max-w-[85%] rounded-2xl px-4 py-3 ${
-                      msg.role === 'user'
-                        ? 'bg-emerald-600 text-white'
-                        : 'bg-muted'
-                    }`}
-                  >
-                    {/* Message Content */}
+              {messages.map(msg => (
+                <div key={msg.id} className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
+                  <div className={`max-w-[85%] rounded-2xl px-4 py-3 ${msg.role === 'user' ? 'bg-emerald-600 text-white' : 'bg-muted'}`}>
                     {msg.role === 'assistant' ? (
                       <div className="prose prose-sm dark:prose-invert max-w-none text-sm">
                         <ReactMarkdown>{msg.content}</ReactMarkdown>
@@ -422,16 +459,11 @@ export function WarRoomView() {
                       <p className="text-sm whitespace-pre-wrap">{msg.content}</p>
                     )}
 
-                    {/* Assistant Metadata */}
                     {msg.role === 'assistant' && (
                       <div className="mt-3 space-y-2">
-                        {/* Badges Row */}
                         <div className="flex flex-wrap gap-1.5">
                           {msg.confidence && CONFIDENCE_LABELS[msg.confidence] && (
-                            <Badge
-                              variant="secondary"
-                              className={`text-[10px] ${CONFIDENCE_LABELS[msg.confidence].color}`}
-                            >
+                            <Badge variant="secondary" className={`text-[10px] ${CONFIDENCE_LABELS[msg.confidence].color}`}>
                               Confiança: {CONFIDENCE_LABELS[msg.confidence].label}
                             </Badge>
                           )}
@@ -440,69 +472,30 @@ export function WarRoomView() {
                               {INTENT_LABELS[msg.intent]}
                             </Badge>
                           )}
-                          {msg.product && (
-                            <Badge variant="outline" className="text-[10px]">
-                              {msg.product}
-                            </Badge>
-                          )}
-                          {msg.module && (
-                            <Badge variant="outline" className="text-[10px]">
-                              {msg.module}
-                            </Badge>
-                          )}
+                          {msg.product && <Badge variant="outline" className="text-[10px]">{msg.product}</Badge>}
+                          {msg.module && <Badge variant="outline" className="text-[10px]">{msg.module}</Badge>}
                         </div>
 
-                        {/* Sources */}
                         {msg.sources && msg.sources.length > 0 && (
-                          <Collapsible
-                            open={expandedSources[msg.id]}
-                            onOpenChange={() => toggleSources(msg.id)}
-                          >
+                          <Collapsible open={expandedSources[msg.id]} onOpenChange={() => toggleSources(msg.id)}>
                             <CollapsibleTrigger asChild>
                               <button className="flex items-center gap-1 text-xs text-emerald-600 dark:text-emerald-400 hover:underline">
-                                <span>
-                                  {msg.sources.length} fonte
-                                  {msg.sources.length !== 1 ? 's' : ''}
-                                </span>
-                                <ChevronDown
-                                  className={`h-3 w-3 transition-transform ${
-                                    expandedSources[msg.id] ? 'rotate-180' : ''
-                                  }`}
-                                />
+                                <span>{msg.sources.length} fonte{msg.sources.length !== 1 ? 's' : ''}</span>
+                                <ChevronDown className={`h-3 w-3 transition-transform ${expandedSources[msg.id] ? 'rotate-180' : ''}`} />
                               </button>
                             </CollapsibleTrigger>
                             <CollapsibleContent>
                               <div className="mt-2 space-y-2">
-                                {msg.sources.map((source) => (
-                                  <div
-                                    key={source.id}
-                                    className="p-2 rounded-md bg-background/60 border text-xs space-y-1"
-                                  >
+                                {msg.sources.map(source => (
+                                  <div key={source.id} className="p-2 rounded-md bg-background/60 border text-xs space-y-1">
                                     <div className="flex items-start justify-between gap-2">
-                                      <p className="font-medium truncate flex-1">
-                                        {source.title}
-                                      </p>
-                                      <Badge
-                                        variant="secondary"
-                                        className="text-[9px] flex-shrink-0"
-                                      >
-                                        {(source.relevance * 100).toFixed(0)}%
-                                      </Badge>
+                                      <p className="font-medium truncate flex-1">{source.title}</p>
+                                      <Badge variant="secondary" className="text-[9px] flex-shrink-0">{(source.relevance * 100).toFixed(0)}%</Badge>
                                     </div>
-                                    <a
-                                      href={source.url}
-                                      target="_blank"
-                                      rel="noopener noreferrer"
-                                      className="text-emerald-600 dark:text-emerald-400 hover:underline flex items-center gap-1 truncate"
-                                    >
-                                      <ExternalLink className="h-3 w-3 flex-shrink-0" />
-                                      <span className="truncate">{source.url}</span>
+                                    <a href={source.url} target="_blank" rel="noopener noreferrer" className="text-emerald-600 dark:text-emerald-400 hover:underline flex items-center gap-1 truncate">
+                                      <ExternalLink className="h-3 w-3 flex-shrink-0" /><span className="truncate">{source.url}</span>
                                     </a>
-                                    {source.snippet && (
-                                      <p className="text-muted-foreground line-clamp-2">
-                                        {source.snippet}
-                                      </p>
-                                    )}
+                                    {source.snippet && <p className="text-muted-foreground line-clamp-2">{source.snippet}</p>}
                                   </div>
                                 ))}
                               </div>
@@ -510,7 +503,6 @@ export function WarRoomView() {
                           </Collapsible>
                         )}
 
-                        {/* Gaps - shown when confidence is low */}
                         {msg.confidence === 'low' && (
                           <div className="flex items-center gap-1 text-xs text-amber-600 dark:text-amber-400">
                             <span>⚠ Lacunas identificadas na documentação</span>
@@ -524,14 +516,15 @@ export function WarRoomView() {
 
               {/* Loading Indicator */}
               {isLoading && (
-                <div className="flex justify-start">
-                  <div className="bg-muted rounded-2xl px-4 py-3 flex items-center gap-2">
-                    <Loader2 className="h-4 w-4 animate-spin text-emerald-500" />
-                    <span className="text-sm text-muted-foreground">
-                      Consultando documentação...
-                    </span>
-                  </div>
-                </div>
+                <ChatLoadingIndicator
+                  stages={WARROOM_STAGES}
+                  stageStatuses={stageStatuses}
+                  currentStageId={currentStageId}
+                  tickerItems={tickerItems}
+                  elapsedSeconds={elapsedSeconds}
+                  onCancel={cancelLoading}
+                  isCancelling={isCancelling}
+                />
               )}
 
               <div ref={messagesEndRef} />
@@ -544,19 +537,14 @@ export function WarRoomView() {
               <Textarea
                 ref={inputRef}
                 value={input}
-                onChange={(e) => setInput(e.target.value)}
+                onChange={e => setInput(e.target.value)}
                 onKeyDown={handleKeyDown}
-                placeholder="Pergunte sobre a documentação Senior..."
+                placeholder="Pergunte sobre soluções Senior, dúvidas de cliente, argumentos de venda..."
                 className="min-h-[44px] max-h-32 resize-none"
                 rows={1}
                 disabled={isLoading}
               />
-              <Button
-                onClick={() => sendMessage()}
-                disabled={isLoading || !input.trim()}
-                size="icon"
-                className="bg-emerald-600 hover:bg-emerald-700 flex-shrink-0"
-              >
+              <Button onClick={() => sendMessage()} disabled={isLoading || !input.trim()} size="icon" className="bg-emerald-600 hover:bg-emerald-700 flex-shrink-0">
                 <Send className="h-4 w-4" />
               </Button>
             </div>

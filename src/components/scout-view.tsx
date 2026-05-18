@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
@@ -19,13 +19,25 @@ import {
   CollapsibleTrigger,
 } from '@/components/ui/collapsible'
 import { PortaScoreDisplay } from '@/components/porta-score-display'
+import {
+  InvestigationLoader,
+  SCOUT_STAGES,
+  PortaScoreLoading,
+  SCOUT_EMPTY_STATES,
+  EmptyState,
+  ErrorStateDisplay,
+  type StageStatus,
+  type TickerItem,
+  type SourceStatusItem,
+  type ConfidenceLevel,
+  type ErrorState,
+} from '@/components/investigation-loader'
 import ReactMarkdown from 'react-markdown'
 import {
   Search,
   Loader2,
   Building2,
   ChevronDown,
-  ChevronRight,
   Eye,
   Trash2,
   ExternalLink,
@@ -36,6 +48,7 @@ import {
   Target,
   MessageSquareQuote,
   Shield,
+  RefreshCw,
 } from 'lucide-react'
 import { toast } from 'sonner'
 
@@ -101,9 +114,7 @@ const SECTOR_OPTIONS = [
   { value: 'logistics', label: 'Logística' },
 ]
 
-const SECTOR_LABELS: Record<string, string> = Object.fromEntries(
-  SECTOR_OPTIONS.map((s) => [s.value, s.label])
-)
+const SECTOR_LABELS: Record<string, string> = Object.fromEntries(SECTOR_OPTIONS.map((s) => [s.value, s.label]))
 
 const SUB_SECTOR_LABELS: Record<string, string> = {
   produtor_larga_escala: 'Produtor Larga Escala',
@@ -146,30 +157,234 @@ const CONFIDENCE_COLORS: Record<string, string> = {
   low: 'bg-rose-100 text-rose-800 dark:bg-rose-900/30 dark:text-rose-400',
 }
 
+// ---------- SSE Hook ----------
+
+function useSSEInvestigation() {
+  const [stageStatuses, setStageStatuses] = useState<Record<string, StageStatus>>({})
+  const [currentStageId, setCurrentStageId] = useState<string | null>(null)
+  const [tickerItems, setTickerItems] = useState<TickerItem[]>([])
+  const [sourceStatuses, setSourceStatuses] = useState<SourceStatusItem[]>([])
+  const [confidence, setConfidence] = useState<ConfidenceLevel | null>(null)
+  const [elapsedSeconds, setElapsedSeconds] = useState(0)
+  const [isCancelling, setIsCancelling] = useState(false)
+  const [isLoading, setIsLoading] = useState(false)
+  const [result, setResult] = useState<Record<string, unknown> | null>(null)
+  const [error, setError] = useState<ErrorState | null>(null)
+  const abortRef = useRef<AbortController | null>(null)
+  const timerRef = useRef<NodeJS.Timeout | null>(null)
+
+  const startInvestigation = async (companyName: string, cnpj?: string) => {
+    setStageStatuses({})
+    setCurrentStageId(null)
+    setTickerItems([])
+    setSourceStatuses([])
+    setConfidence(null)
+    setElapsedSeconds(0)
+    setIsCancelling(false)
+    setResult(null)
+    setError(null)
+    setIsLoading(true)
+
+    timerRef.current = setInterval(() => {
+      setElapsedSeconds(prev => prev + 1)
+    }, 1000)
+
+    const abortController = new AbortController()
+    abortRef.current = abortController
+
+    try {
+      const response = await fetch('/api/scout/investigate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ companyName, cnpj: cnpj || undefined }),
+        signal: abortController.signal,
+      })
+
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => ({}))
+        throw new Error(errorData.error || 'Erro na investigação')
+      }
+
+      const contentType = response.headers.get('content-type') || ''
+      if (contentType.includes('text/event-stream')) {
+        const reader = response.body?.getReader()
+        if (!reader) throw new Error('No response body')
+
+        const decoder = new TextDecoder()
+        let buffer = ''
+
+        while (true) {
+          const { done, value } = await reader.read()
+          if (done) break
+
+          buffer += decoder.decode(value, { stream: true })
+          const parts = buffer.split('\n\n')
+          buffer = parts.pop() || ''
+
+          for (const part of parts) {
+            const lines = part.split('\n')
+            let eventType = ''
+            let dataStr = ''
+            for (const line of lines) {
+              if (line.startsWith('event: ')) eventType = line.slice(7)
+              if (line.startsWith('data: ')) dataStr = line.slice(6)
+            }
+            if (!dataStr) continue
+            try {
+              const event = JSON.parse(dataStr)
+              handleEvent(eventType, event)
+            } catch { /* skip */ }
+          }
+        }
+      } else {
+        const data = await response.json()
+        if (data.error) {
+          setError({ type: 'unknown', message: data.error || data.details || 'Erro na investigação' })
+        } else {
+          setResult(data)
+        }
+        setIsLoading(false)
+        if (timerRef.current) clearInterval(timerRef.current)
+      }
+    } catch (err) {
+      if (err instanceof Error && err.name === 'AbortError') {
+        setError({ type: 'cancelled', message: 'Investigação cancelada pelo usuário.' })
+      } else {
+        setError({ type: 'unknown', message: err instanceof Error ? err.message : 'Erro na investigação' })
+      }
+      setIsLoading(false)
+      if (timerRef.current) clearInterval(timerRef.current)
+    }
+  }
+
+  const handleEvent = (eventType: string, event: Record<string, unknown>) => {
+    switch (eventType) {
+      case 'progress_stage_started':
+        setStageStatuses(prev => ({ ...prev, [event.stageId as string]: 'active' }))
+        setCurrentStageId(event.stageId as string || null)
+        if (event.message) {
+          setTickerItems(prev => [...prev, {
+            id: `t-${event.stageId}-${Date.now()}`,
+            message: event.message as string,
+            type: 'info',
+            timestamp: Date.now(),
+          }])
+        }
+        break
+      case 'progress_stage_completed':
+        setStageStatuses(prev => ({ ...prev, [event.stageId as string]: 'completed' }))
+        setTickerItems(prev => [...prev, {
+          id: `t-${event.stageId}-done-${Date.now()}`,
+          message: `${event.label || event.stageId} ✓`,
+          type: 'found',
+          timestamp: Date.now(),
+        }])
+        break
+      case 'progress_stage_warning':
+        setStageStatuses(prev => ({ ...prev, [event.stageId as string]: 'warning' }))
+        if (event.message) {
+          setTickerItems(prev => [...prev, {
+            id: `t-${event.stageId}-warn-${Date.now()}`,
+            message: event.message as string,
+            type: 'warning',
+            timestamp: Date.now(),
+          }])
+        }
+        break
+      case 'progress_stage_failed':
+        setStageStatuses(prev => ({ ...prev, [event.stageId as string]: 'failed' }))
+        setError({ type: 'api_down', message: (event.message as string) || 'Uma etapa falhou.' })
+        break
+      case 'evidence_found':
+        setTickerItems(prev => [...prev, {
+          id: `ev-${Date.now()}-${Math.random()}`,
+          message: (event.message as string) || 'Evidência encontrada',
+          type: 'found',
+          timestamp: Date.now(),
+        }])
+        if (typeof event.confidence === 'number') {
+          setConfidence(event.confidence >= 0.7 ? 'alta' : event.confidence >= 0.4 ? 'média' : 'baixa')
+        }
+        break
+      case 'source_checked':
+        if (event.source) {
+          const srcName = event.source as string
+          const sev = event.severity as string
+          const statusMap: Record<string, SourceStatusItem['status']> = {
+            ok: 'ok', failed: 'falhou', cache: 'cache', consulting: 'consultando', warning: 'cache', info: 'ok', ignored: 'ignorado',
+          }
+          setSourceStatuses(prev => {
+            const existing = prev.findIndex(s => s.name === srcName)
+            const item: SourceStatusItem = { name: srcName, label: srcName, status: statusMap[sev] || 'ok' }
+            if (existing >= 0) { const u = [...prev]; u[existing] = item; return u }
+            return [...prev, item]
+          })
+        }
+        break
+      case 'confidence_updated':
+        if (typeof event.confidence === 'number') {
+          setConfidence(event.confidence >= 0.7 ? 'alta' : event.confidence >= 0.4 ? 'média' : 'baixa')
+        }
+        break
+      case 'final_response_ready':
+        if (event.metadata && !(event.metadata as Record<string, unknown>).error) {
+          setResult(event.metadata as Record<string, unknown>)
+        } else if ((event.metadata as Record<string, unknown>)?.error) {
+          setError({ type: 'unknown', message: ((event.metadata as Record<string, unknown>).message as string) || 'Erro na investigação' })
+        }
+        setIsLoading(false)
+        if (timerRef.current) clearInterval(timerRef.current)
+        // Complete all remaining stages
+        setStageStatuses(prev => {
+          const updated = { ...prev }
+          SCOUT_STAGES.forEach(stage => {
+            if (updated[stage.id] !== 'completed' && updated[stage.id] !== 'failed' && updated[stage.id] !== 'warning') {
+              updated[stage.id] = 'completed'
+            }
+          })
+          return updated
+        })
+        break
+    }
+  }
+
+  const cancel = () => {
+    setIsCancelling(true)
+    if (abortRef.current) abortRef.current.abort()
+    if (timerRef.current) clearInterval(timerRef.current)
+    setIsLoading(false)
+  }
+
+  return {
+    stageStatuses, currentStageId, tickerItems, sourceStatuses,
+    confidence, elapsedSeconds, isCancelling, isLoading, result, error,
+    startInvestigation, cancel,
+  }
+}
+
 // ---------- Component ----------
 
 export function ScoutView() {
   const [investigations, setInvestigations] = useState<Investigation[]>([])
-  const [isLoading, setIsLoading] = useState(false)
   const [isLoadingList, setIsLoadingList] = useState(true)
   const [companyName, setCompanyName] = useState('')
   const [cnpj, setCnpj] = useState('')
-  const [sector, setSector] = useState('')
   const [selectedInvestigation, setSelectedInvestigation] = useState<Investigation | null>(null)
   const [expandedSections, setExpandedSections] = useState<Record<string, boolean>>({
-    evidences: true,
-    thesis: false,
-    sources: false,
-    raw: false,
+    evidences: true, thesis: false, sources: false, raw: false,
   })
 
-  // Parse JSON fields safely
+  const {
+    stageStatuses, currentStageId, tickerItems, sourceStatuses,
+    confidence, elapsedSeconds, isCancelling, isLoading, result, error,
+    startInvestigation, cancel,
+  } = useSSEInvestigation()
+
   const parseJson = <T,>(jsonStr: string | null | undefined, fallback: T): T => {
     if (!jsonStr) return fallback
     try { return JSON.parse(jsonStr) } catch { return fallback }
   }
 
-  // Load investigations
   const loadInvestigations = useCallback(async () => {
     try {
       const res = await fetch('/api/scout/investigations')
@@ -177,76 +392,43 @@ export function ScoutView() {
         const data = await res.json()
         setInvestigations(data.investigations || [])
       }
-    } catch {
-      // silent
-    } finally {
-      setIsLoadingList(false)
-    }
+    } catch { /* */ } finally { setIsLoadingList(false) }
   }, [])
 
-  useEffect(() => {
-    loadInvestigations()
-  }, [loadInvestigations])
+  useEffect(() => { loadInvestigations() }, [loadInvestigations])
 
-  // Investigate
+  // When SSE result arrives, update investigation list
+  useEffect(() => {
+    if (result && (result as Record<string, unknown>).investigation) {
+      const invData = (result as { investigation: Investigation; portaScore: PortaScoreData })
+      const newInvestigation: Investigation = { ...invData.investigation, portaScore: invData.portaScore }
+      setInvestigations(prev => [newInvestigation, ...prev])
+      setSelectedInvestigation(newInvestigation)
+      toast.success(`Investigação de "${newInvestigation.companyName}" concluída!`)
+      setCompanyName('')
+      setCnpj('')
+    }
+  }, [result])
+
   const handleInvestigate = async () => {
     if (!companyName.trim()) {
       toast.error('Nome da empresa é obrigatório')
       return
     }
-
-    setIsLoading(true)
-    try {
-      const res = await fetch('/api/scout/investigate', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          companyName: companyName.trim(),
-          cnpj: cnpj.trim() || undefined,
-        }),
-      })
-
-      if (!res.ok) {
-        const errorData = await res.json().catch(() => ({}))
-        throw new Error(errorData.error || 'Erro na investigação')
-      }
-
-      const data = await res.json()
-      toast.success(`Investigação de "${companyName}" concluída!`)
-
-      const newInvestigation: Investigation = {
-        ...data.investigation,
-        portaScore: data.portaScore,
-      }
-      setInvestigations((prev) => [newInvestigation, ...prev])
-      setSelectedInvestigation(newInvestigation)
-      setCompanyName('')
-      setCnpj('')
-      setSector('')
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : 'Erro na investigação')
-    } finally {
-      setIsLoading(false)
-    }
+    await startInvestigation(companyName.trim(), cnpj.trim() || undefined)
   }
 
-  // Delete investigation
   const deleteInvestigation = async (id: string) => {
     try {
       const res = await fetch(`/api/scout/investigations/${id}`, { method: 'DELETE' })
       if (res.ok) {
-        setInvestigations((prev) => prev.filter((i) => i.id !== id))
-        if (selectedInvestigation?.id === id) {
-          setSelectedInvestigation(null)
-        }
+        setInvestigations(prev => prev.filter(i => i.id !== id))
+        if (selectedInvestigation?.id === id) setSelectedInvestigation(null)
         toast.success('Investigação excluída')
       }
-    } catch {
-      toast.error('Erro ao excluir investigação')
-    }
+    } catch { toast.error('Erro ao excluir investigação') }
   }
 
-  // View investigation detail
   const viewInvestigation = async (id: string) => {
     try {
       const res = await fetch(`/api/scout/investigations/${id}`)
@@ -254,16 +436,13 @@ export function ScoutView() {
         const data = await res.json()
         setSelectedInvestigation(data.investigation)
       }
-    } catch {
-      toast.error('Erro ao carregar detalhes')
-    }
+    } catch { toast.error('Erro ao carregar detalhes') }
   }
 
   const toggleSection = (key: string) => {
     setExpandedSections(prev => ({ ...prev, [key]: !prev[key] }))
   }
 
-  // Parsed data for selected investigation
   const evidenceList = parseJson<Evidence[]>(selectedInvestigation?.evidences, [])
   const classification = parseJson<Record<string, string>>(selectedInvestigation?.classification, {})
   const thesis = parseJson<CommercialThesis>(selectedInvestigation?.commercialThesis, {})
@@ -310,6 +489,7 @@ export function ScoutView() {
                     onChange={(e) => setCompanyName(e.target.value)}
                     placeholder="Ex: Scheffer Agropecuária"
                     disabled={isLoading}
+                    onKeyDown={(e) => e.key === 'Enter' && !isLoading && handleInvestigate()}
                   />
                 </div>
                 <div className="space-y-1.5">
@@ -320,6 +500,7 @@ export function ScoutView() {
                     onChange={(e) => setCnpj(e.target.value)}
                     placeholder="00.000.000/0000-00"
                     disabled={isLoading}
+                    onKeyDown={(e) => e.key === 'Enter' && !isLoading && handleInvestigate()}
                   />
                 </div>
               </div>
@@ -330,28 +511,45 @@ export function ScoutView() {
                   className="bg-emerald-600 hover:bg-emerald-700"
                 >
                   {isLoading ? (
-                    <>
-                      <Loader2 className="h-4 w-4 mr-2 animate-spin" />
-                      Investigando...
-                    </>
+                    <><Loader2 className="h-4 w-4 mr-2 animate-spin" />Investigando...</>
                   ) : (
-                    <>
-                      <Search className="h-4 w-4 mr-2" />
-                      Investigar
-                    </>
+                    <><Search className="h-4 w-4 mr-2" />Investigar</>
                   )}
                 </Button>
-                {isLoading && (
-                  <p className="text-xs text-muted-foreground animate-pulse">
-                    Buscando fontes, extraindo fatos, classificando empresa, calculando score auditável...
-                  </p>
-                )}
               </div>
             </CardContent>
           </Card>
 
+          {/* Investigation Loader (SSE Progress) */}
+          {isLoading && (
+            <InvestigationLoader
+              stages={SCOUT_STAGES}
+              stageStatuses={stageStatuses}
+              currentStageId={currentStageId}
+              tickerItems={tickerItems}
+              sourceStatuses={sourceStatuses}
+              confidence={confidence}
+              elapsedSeconds={elapsedSeconds}
+              onCancel={cancel}
+              isCancelling={isCancelling}
+              variant="scout"
+              companyName={companyName}
+              errorState={null}
+            />
+          )}
+
+          {/* Error state after failed investigation */}
+          {error && !isLoading && (
+            <ErrorStateDisplay
+              error={error}
+              onRetry={() => {
+                if (companyName.trim()) startInvestigation(companyName.trim(), cnpj.trim() || undefined)
+              }}
+            />
+          )}
+
           {/* Selected Investigation Detail */}
-          {selectedInvestigation && (
+          {selectedInvestigation && !isLoading && (
             <div className="space-y-4">
               {/* Header Card */}
               <Card>
@@ -374,7 +572,6 @@ export function ScoutView() {
                       )}
                     </div>
                   </div>
-                  {/* Classification badges */}
                   {classification && Object.keys(classification).length > 0 && (
                     <div className="flex flex-wrap gap-1.5 mt-2">
                       {classification.companyType && classification.companyType !== 'indefinido' && (
@@ -388,7 +585,6 @@ export function ScoutView() {
                       )}
                     </div>
                   )}
-                  {/* Quality check warning */}
                   {qcResult && !qcResult.passed && qcResult.issues.length > 0 && (
                     <div className="mt-2 p-2 bg-amber-50 dark:bg-amber-950/20 rounded-md border border-amber-200 dark:border-amber-800">
                       <p className="text-[10px] font-medium text-amber-700 dark:text-amber-400 flex items-center gap-1">
@@ -428,7 +624,6 @@ export function ScoutView() {
                 </CollapsibleTrigger>
                 <CollapsibleContent>
                   <div className="space-y-2 mt-2">
-                    {/* Facts */}
                     {facts.length > 0 && (
                       <div className="space-y-1.5">
                         <p className="text-xs font-semibold text-emerald-600 dark:text-emerald-400 flex items-center gap-1">
@@ -445,8 +640,6 @@ export function ScoutView() {
                         ))}
                       </div>
                     )}
-
-                    {/* Hypotheses */}
                     {hypotheses.length > 0 && (
                       <div className="space-y-1.5">
                         <p className="text-xs font-semibold text-amber-600 dark:text-amber-400 flex items-center gap-1">
@@ -456,15 +649,10 @@ export function ScoutView() {
                           <div key={i} className={`p-2.5 rounded-md text-sm ${EVIDENCE_STYLES.hypotesis.color}`}>
                             <p className="font-medium">{e.claim}</p>
                             <p className="text-[10px] text-muted-foreground mt-1">Indício: {e.source}</p>
-                            <Badge className={`text-[9px] mt-1 ${CONFIDENCE_COLORS[e.confidence] || ''}`}>
-                              Confiança: {e.confidence === 'high' ? 'Alta' : e.confidence === 'medium' ? 'Média' : 'Baixa'}
-                            </Badge>
                           </div>
                         ))}
                       </div>
                     )}
-
-                    {/* Gaps */}
                     {gaps.length > 0 && (
                       <div className="space-y-1.5">
                         <p className="text-xs font-semibold text-rose-600 dark:text-rose-400 flex items-center gap-1">
@@ -477,8 +665,6 @@ export function ScoutView() {
                         ))}
                       </div>
                     )}
-
-                    {/* Recommendations */}
                     {recommendations.length > 0 && (
                       <div className="space-y-1.5">
                         <p className="text-xs font-semibold text-teal-600 dark:text-teal-400 flex items-center gap-1">
@@ -513,71 +699,58 @@ export function ScoutView() {
                         </CardContent>
                       </Card>
                     )}
-
                     {thesis.seniorModules && thesis.seniorModules.length > 0 && (
                       <div>
                         <p className="text-xs font-semibold mb-1.5">Módulos Senior Sugeridos</p>
                         <div className="flex flex-wrap gap-1.5">
-                          {thesis.seniorModules.map((m, i) => (
-                            <Badge key={i} variant="secondary" className="text-xs">{m}</Badge>
-                          ))}
+                          {thesis.seniorModules.map((m, i) => <Badge key={i} variant="secondary" className="text-xs">{m}</Badge>)}
                         </div>
                       </div>
                     )}
-
                     {thesis.painPoints && thesis.painPoints.length > 0 && (
                       <div>
                         <p className="text-xs font-semibold mb-1.5">Dores Prováveis</p>
                         <div className="space-y-1">
                           {thesis.painPoints.map((p, i) => (
                             <p key={i} className="text-xs text-muted-foreground flex items-start gap-1.5">
-                              <AlertTriangle className="h-3 w-3 text-amber-500 flex-shrink-0 mt-0.5" />
-                              {p}
+                              <AlertTriangle className="h-3 w-3 text-amber-500 flex-shrink-0 mt-0.5" />{p}
                             </p>
                           ))}
                         </div>
                       </div>
                     )}
-
                     {thesis.decisionMakers && thesis.decisionMakers.length > 0 && (
                       <div>
                         <p className="text-xs font-semibold mb-1.5">Decisores Prováveis</p>
                         <div className="flex flex-wrap gap-1.5">
-                          {thesis.decisionMakers.map((d, i) => (
-                            <Badge key={i} variant="outline" className="text-[10px]">{d}</Badge>
-                          ))}
+                          {thesis.decisionMakers.map((d, i) => <Badge key={i} variant="outline" className="text-[10px]">{d}</Badge>)}
                         </div>
                       </div>
                     )}
-
                     {thesis.risks && thesis.risks.length > 0 && (
                       <div>
                         <p className="text-xs font-semibold mb-1.5">Riscos</p>
                         <div className="space-y-1">
                           {thesis.risks.map((r, i) => (
                             <p key={i} className="text-xs text-rose-600 dark:text-rose-400 flex items-start gap-1.5">
-                              <Shield className="h-3 w-3 flex-shrink-0 mt-0.5" />
-                              {r}
+                              <Shield className="h-3 w-3 flex-shrink-0 mt-0.5" />{r}
                             </p>
                           ))}
                         </div>
                       </div>
                     )}
-
                     {thesis.nextSteps && thesis.nextSteps.length > 0 && (
                       <div>
                         <p className="text-xs font-semibold mb-1.5">Próximos Passos</p>
                         <div className="space-y-1">
                           {thesis.nextSteps.map((s, i) => (
                             <p key={i} className="text-xs text-muted-foreground flex items-start gap-1.5">
-                              <span className="text-emerald-500 font-bold flex-shrink-0">{i + 1}.</span>
-                              {s}
+                              <span className="text-emerald-500 font-bold flex-shrink-0">{i + 1}.</span>{s}
                             </p>
                           ))}
                         </div>
                       </div>
                     )}
-
                     {thesis.smartQuestions && thesis.smartQuestions.length > 0 && (
                       <div>
                         <p className="text-xs font-semibold mb-1.5 flex items-center gap-1">
@@ -585,9 +758,7 @@ export function ScoutView() {
                         </p>
                         <div className="space-y-1.5">
                           {thesis.smartQuestions.map((q, i) => (
-                            <div key={i} className="p-2 rounded-md bg-muted/50 text-xs">
-                              {q}
-                            </div>
+                            <div key={i} className="p-2 rounded-md bg-muted/50 text-xs">{q}</div>
                           ))}
                         </div>
                       </div>
@@ -610,40 +781,13 @@ export function ScoutView() {
                     {sourcesList.map((s, i) => (
                       <div key={i} className="p-2 rounded-md bg-muted/30 text-xs space-y-0.5">
                         <p className="font-medium truncate">{s.title}</p>
-                        <a
-                          href={s.url}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          className="text-emerald-600 dark:text-emerald-400 hover:underline flex items-center gap-1 truncate"
-                        >
-                          <ExternalLink className="h-3 w-3 flex-shrink-0" />
-                          <span className="truncate">{s.url}</span>
+                        <a href={s.url} target="_blank" rel="noopener noreferrer" className="text-emerald-600 dark:text-emerald-400 hover:underline flex items-center gap-1 truncate">
+                          <ExternalLink className="h-3 w-3 flex-shrink-0" /><span className="truncate">{s.url}</span>
                         </a>
                         {s.snippet && <p className="text-muted-foreground line-clamp-2">{s.snippet}</p>}
                       </div>
                     ))}
                   </div>
-                </CollapsibleContent>
-              </Collapsible>
-
-              {/* Raw Data */}
-              <Collapsible open={expandedSections.raw} onOpenChange={() => toggleSection('raw')}>
-                <CollapsibleTrigger asChild>
-                  <button className="flex items-center gap-2 text-xs text-muted-foreground hover:text-foreground w-full text-left py-1">
-                    <ChevronDown className={`h-3 w-3 transition-transform ${expandedSections.raw ? '' : '-rotate-90'}`} />
-                    Dados brutos (JSON)
-                  </button>
-                </CollapsibleTrigger>
-                <CollapsibleContent>
-                  <pre className="p-3 bg-muted rounded-md text-[10px] overflow-x-auto max-h-48 overflow-y-auto">
-                    {(() => {
-                      try {
-                        return JSON.stringify(JSON.parse(selectedInvestigation.rawData || '{}'), null, 2)
-                      } catch {
-                        return selectedInvestigation.rawData
-                      }
-                    })()}
-                  </pre>
                 </CollapsibleContent>
               </Collapsible>
             </div>
@@ -657,63 +801,37 @@ export function ScoutView() {
                 <Loader2 className="h-5 w-5 animate-spin text-muted-foreground" />
               </div>
             ) : investigations.length === 0 ? (
-              <Card>
-                <CardContent className="py-8 text-center">
-                  <Search className="h-8 w-8 text-muted-foreground mx-auto mb-2" />
-                  <p className="text-sm text-muted-foreground">
-                    Nenhuma investigação realizada ainda.
-                  </p>
-                  <p className="text-xs text-muted-foreground">
-                    Use o formulário acima para investigar empresas com base em evidências.
-                  </p>
-                </CardContent>
-              </Card>
+              <EmptyState config={SCOUT_EMPTY_STATES.no_investigations} />
             ) : (
               <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
                 {investigations.map((inv) => (
                   <Card
                     key={inv.id}
-                    className={`cursor-pointer transition-all hover:shadow-md ${
-                      selectedInvestigation?.id === inv.id ? 'ring-2 ring-emerald-500' : ''
-                    }`}
+                    className={`cursor-pointer transition-all hover:shadow-md ${selectedInvestigation?.id === inv.id ? 'ring-2 ring-emerald-500' : ''}`}
                   >
                     <CardContent className="p-4">
                       <div className="flex items-start justify-between gap-2">
                         <div className="flex-1 min-w-0">
                           <p className="font-medium text-sm truncate">{inv.companyName}</p>
                           <div className="flex flex-wrap gap-1 mt-1">
-                            {inv.sector && (
-                              <Badge variant="outline" className="text-[10px]">
-                                {SECTOR_LABELS[inv.sector] || inv.sector}
-                              </Badge>
-                            )}
-                            {inv.subSector && (
-                              <Badge variant="outline" className="text-[10px] text-emerald-600">
-                                {SUB_SECTOR_LABELS[inv.subSector] || inv.subSector}
-                              </Badge>
-                            )}
+                            {inv.sector && <Badge variant="outline" className="text-[10px]">{SECTOR_LABELS[inv.sector] || inv.sector}</Badge>}
+                            {inv.subSector && <Badge variant="outline" className="text-[10px] text-emerald-600">{SUB_SECTOR_LABELS[inv.subSector] || inv.subSector}</Badge>}
                           </div>
                         </div>
                         <Badge className={`text-[10px] ${STATUS_COLORS[inv.status] || ''}`}>
                           {STATUS_LABELS[inv.status] || inv.status}
                         </Badge>
                       </div>
-
                       {inv.portaScore && (
                         <div className="mt-2 flex items-center gap-2">
                           <span className="text-xs text-muted-foreground">PORTA:</span>
-                          <span className={`text-sm font-bold ${
-                            inv.portaScore.total >= 6 ? 'text-emerald-600' : inv.portaScore.total >= 3 ? 'text-amber-600' : 'text-rose-600'
-                          }`}>
+                          <span className={`text-sm font-bold ${inv.portaScore.total >= 6 ? 'text-emerald-600' : inv.portaScore.total >= 3 ? 'text-amber-600' : 'text-rose-600'}`}>
                             {inv.portaScore.total.toFixed(1)}
                           </span>
                         </div>
                       )}
-
                       <div className="mt-2 flex items-center justify-between">
-                        <p className="text-[10px] text-muted-foreground">
-                          {new Date(inv.createdAt).toLocaleDateString('pt-BR')}
-                        </p>
+                        <p className="text-[10px] text-muted-foreground">{new Date(inv.createdAt).toLocaleDateString('pt-BR')}</p>
                         <div className="flex gap-1">
                           <Button variant="ghost" size="sm" className="h-7 w-7 p-0" onClick={() => viewInvestigation(inv.id)}>
                             <Eye className="h-3 w-3" />

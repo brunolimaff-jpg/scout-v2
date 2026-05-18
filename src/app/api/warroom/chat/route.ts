@@ -20,18 +20,20 @@ function stripHtml(html: string): string {
 }
 
 // ============================================================
-// Intent classification prompt
+// Intent classification for commercial context
 // ============================================================
-const INTENT_SYSTEM_PROMPT = `Você é um classificador de intenção para perguntas sobre a plataforma Senior.
+const INTENT_SYSTEM_PROMPT = `Você é um classificador de intenção para perguntas de vendedores/consultores da Senior sobre a plataforma.
 
 Classifique a intenção em UMA das seguintes categorias:
 - documentation: pergunta sobre documentação geral de um produto/módulo
-- error: pergunta sobre um erro ou problema específico
+- error: pergunta sobre um erro ou problema específico do cliente
 - config: pergunta sobre como configurar algo
 - step_by_step: pergunta pedindo um passo a passo de como fazer algo
 - concept: pergunta sobre um conceito ou definição
 - integration: pergunta sobre integração entre produtos/módulos
 - business_rule: pergunta sobre regras de negócio, cálculos, fórmulas
+- commercial: pergunta sobre argumentos de venda, dores atendidas, posicionamento comercial
+- client_doubt: pergunta que um cliente fez e o vendedor precisa responder
 - unrelated: pergunta que não tem relação com a plataforma Senior
 
 Responda APENAS com a categoria, nada mais.
@@ -57,27 +59,39 @@ Responda APENAS com o JSON, nada mais.
 Pergunta: `;
 
 // ============================================================
-// Anti-hallucination answer generation prompt
+// Commercial answer generation prompt
 // ============================================================
 function buildAnswerSystemPrompt(context: string): string {
-  return `Você é um assistente especializado na documentação oficial da Senior (documentacao.senior.com.br).
+  return `Você é um especialista comercial da Senior. Sua função é ajudar vendedores, consultores, SDRs e CS a entender soluções Senior, responder clientes e vender melhor.
+
+Você consulta a documentação oficial Senior (documentacao.senior.com.br) como fonte de verdade, mas traduz em linguagem comercial, simples e acionável.
 
 REGRAS ESTRITAS:
-1. NUNCA afirme algo como verdade que não veio da documentação ou de fonte explicitamente marcada.
-2. Se não encontrar fonte, responda que não encontrou.
+1. NUNCA afirme algo como verdade que não veio da documentação ou de fonte explícita.
+2. Se não encontrar fonte, responda que não encontrou na documentação.
 3. Se a fonte for parcial, responda com confiança média/baixa.
 4. NÃO invente nome de tela, parâmetro, campo ou rotina.
 5. NÃO invente link.
-6. Sempre prefixe respostas com "Com base na documentação Senior..." ou "A documentação indica que..."
-7. Se a pergunta não for sobre documentação Senior, diga: "Essa pergunta parece mais adequada ao Scout/Radar/CRM do que ao War Room de documentação Senior."
+6. NÃO prometa funcionalidade que não está na documentação.
+7. Quando a documentação for técnica, resuma em linguagem simples para vendedor.
+8. Quando houver risco de promessa indevida, ALERTe o vendedor.
+9. Sempre tente dar ao vendedor algo ÚTIL para usar na conversa com o cliente.
 
-Formato da resposta:
-**Resposta direta:** [explicação curta e objetiva]
-**Passo a passo:** [quando aplicável, liste os passos]
-**Observações importantes:** [regras, exceções, limitações, pré-requisitos]
-**Referências:** [links da documentação oficial usados]
-**Confiança:** [Alta/Média/Baixa]
-**Lacunas:** [o que não foi encontrado ou precisa validar]
+FORMATO DA RESPOSTA (sempre use estes 7 blocos):
+
+**Resposta direta:** [explicação curta e clara, em linguagem de vendedor]
+
+**Tradução comercial:** [o que isso significa para o cliente, qual dor resolve, qual benefício traz]
+
+**Como falar com o cliente:** [sugestão de frase ou abordagem que o vendedor pode usar na call]
+
+**Perguntas de descoberta:** [2-4 perguntas que o vendedor pode fazer na reunião para diagnosticar a necessidade do cliente]
+
+**Pré-requisitos ou cuidados:** [o que validar antes de prometer algo, dependências, configurações necessárias]
+
+**Referências oficiais:** [links da documentação oficial usados, sempre que possível]
+
+**Confiança:** [Alta/Média/Baixa] — **Lacunas:** [o que a documentação não deixou claro ou não foi encontrado]
 
 CONTEXTO DA DOCUMENTAÇÃO ENCONTRADA:
 ${context}`;
@@ -117,9 +131,7 @@ export async function POST(request: NextRequest) {
 
     const zai = await ZAI.create();
 
-    // ----------------------------------------------------------
     // Step 1: Classify intent
-    // ----------------------------------------------------------
     let intent = 'documentation';
     try {
       const intentResult = await zai.chat.completions.create({
@@ -131,24 +143,15 @@ export async function POST(request: NextRequest) {
       });
       const rawIntent = intentResult.choices?.[0]?.message?.content?.trim().toLowerCase() || '';
       const validIntents = [
-        'documentation',
-        'error',
-        'config',
-        'step_by_step',
-        'concept',
-        'integration',
-        'business_rule',
-        'unrelated',
+        'documentation', 'error', 'config', 'step_by_step', 'concept',
+        'integration', 'business_rule', 'commercial', 'client_doubt', 'unrelated',
       ];
       intent = validIntents.includes(rawIntent) ? rawIntent : 'documentation';
     } catch {
-      // Fallback to default intent
       intent = 'documentation';
     }
 
-    // ----------------------------------------------------------
     // Step 2: Extract key terms
-    // ----------------------------------------------------------
     let keyTerms: Record<string, string | null> = {};
     try {
       const termsResult = await zai.chat.completions.create({
@@ -159,16 +162,13 @@ export async function POST(request: NextRequest) {
         thinking: { type: 'disabled' },
       });
       const rawTerms = termsResult.choices?.[0]?.message?.content?.trim() || '{}';
-      // Try to parse JSON, handling potential markdown code blocks
       const jsonStr = rawTerms.replace(/```json?\n?/g, '').replace(/```/g, '').trim();
       keyTerms = JSON.parse(jsonStr);
     } catch {
       keyTerms = {};
     }
 
-    // ----------------------------------------------------------
     // Step 3: Build search query
-    // ----------------------------------------------------------
     const searchParts: string[] = [message];
     if (keyTerms.product) searchParts.push(keyTerms.product);
     if (keyTerms.module) searchParts.push(keyTerms.module);
@@ -176,9 +176,7 @@ export async function POST(request: NextRequest) {
     if (keyTerms.error) searchParts.push(keyTerms.error);
     const searchQuery = searchParts.join(' ') + ' site:documentacao.senior.com.br';
 
-    // ----------------------------------------------------------
     // Step 4: Search Senior documentation
-    // ----------------------------------------------------------
     interface SearchHit {
       url: string;
       title?: string;
@@ -192,80 +190,48 @@ export async function POST(request: NextRequest) {
         query: searchQuery,
         num: 10,
       });
-      // The web_search function returns results in various formats
       if (Array.isArray(searchResponse)) {
         searchResults = searchResponse;
       } else if (searchResponse && typeof searchResponse === 'object') {
         const resp = searchResponse as Record<string, unknown>;
-        if (Array.isArray(resp.results)) {
-          searchResults = resp.results as SearchHit[];
-        } else if (Array.isArray(resp.items)) {
-          searchResults = resp.items as SearchHit[];
-        }
+        if (Array.isArray(resp.results)) searchResults = resp.results as SearchHit[];
+        else if (Array.isArray(resp.items)) searchResults = resp.items as SearchHit[];
       }
     } catch {
       searchResults = [];
     }
 
-    // ----------------------------------------------------------
     // Step 5: Read top pages (with snippet fallback)
-    // ----------------------------------------------------------
     interface PageContent {
       url: string;
       title: string;
       content: string;
-      isFullContent: boolean; // true if from page_reader, false if snippet-only
+      isFullContent: boolean;
     }
 
     const pagesToRead = searchResults.slice(0, 5);
     const pageContents: PageContent[] = [];
-
-    // Helper: timeout wrapper for promises
     const withTimeout = <T>(promise: Promise<T>, ms: number): Promise<T | null> =>
-      Promise.race([
-        promise,
-        new Promise<null>((resolve) => setTimeout(() => resolve(null), ms)),
-      ]);
+      Promise.race([promise, new Promise<null>((resolve) => setTimeout(() => resolve(null), ms))]);
 
     for (const result of pagesToRead) {
       const url = result.url;
       if (!url || !url.includes('documentacao.senior.com.br')) continue;
 
       try {
-        // Check cache first
-        const cached = await db.documentationPage.findUnique({
-          where: { url },
-        });
-
+        const cached = await db.documentationPage.findUnique({ where: { url } });
         if (cached && cached.content.length > 50) {
-          pageContents.push({
-            url: cached.url,
-            title: cached.title,
-            content: cached.content.slice(0, 8000),
-            isFullContent: true,
-          });
+          pageContents.push({ url: cached.url, title: cached.title, content: cached.content.slice(0, 8000), isFullContent: true });
         } else {
-          // Try page_reader with 15s timeout
-          const pageData = await withTimeout(
-            zai.functions.invoke('page_reader', { url }),
-            15000
-          );
-
+          const pageData = await withTimeout(zai.functions.invoke('page_reader', { url }), 15000);
           let extractedContent = '';
           let extractedTitle = result.title || url;
           let isFullContent = false;
 
           if (pageData && typeof pageData === 'object') {
             const pd = pageData as Record<string, unknown>;
-            // page_reader returns { data: { title, html, ... } } or { title, content, ... }
             const dataObj = (pd.data as Record<string, unknown>) || pd;
-            const rawContent =
-              (dataObj.content as string) ||
-              (dataObj.text as string) ||
-              (dataObj.markdown as string) ||
-              (dataObj.html as string) ||
-              '';
-            // Strip HTML for clean text
+            const rawContent = (dataObj.content as string) || (dataObj.text as string) || (dataObj.markdown as string) || (dataObj.html as string) || '';
             extractedContent = rawContent.includes('<') ? stripHtml(rawContent) : rawContent;
             extractedTitle = (dataObj.title as string) || extractedTitle;
           } else if (typeof pageData === 'string') {
@@ -273,84 +239,46 @@ export async function POST(request: NextRequest) {
             extractedContent = raw.includes('<') ? stripHtml(raw) : raw;
           }
 
-          // Truncate to avoid massive prompts
           extractedContent = extractedContent.slice(0, 8000);
 
           if (extractedContent.length > 50) {
             isFullContent = true;
-            // Cache the page
             try {
               await db.documentationPage.upsert({
                 where: { url },
-                update: {
-                  title: extractedTitle,
-                  content: extractedContent,
-                  product: keyTerms.product || null,
-                  module: keyTerms.module || null,
-                },
-                create: {
-                  url,
-                  title: extractedTitle,
-                  content: extractedContent,
-                  product: keyTerms.product || null,
-                  module: keyTerms.module || null,
-                },
+                update: { title: extractedTitle, content: extractedContent, product: keyTerms.product || null, module: keyTerms.module || null },
+                create: { url, title: extractedTitle, content: extractedContent, product: keyTerms.product || null, module: keyTerms.module || null },
               });
-            } catch {
-              // Cache write failure is non-critical
-            }
+            } catch { /* non-critical */ }
           } else {
-            // Fallback: use search snippet as context
             const snippet = result.snippet || '';
-            if (snippet.length > 0) {
-              extractedContent = `[Resumo da página]: ${snippet}`;
-              isFullContent = false;
-            }
+            if (snippet.length > 0) { extractedContent = `[Resumo da página]: ${snippet}`; isFullContent = false; }
           }
 
           if (extractedContent.length > 0) {
-            pageContents.push({
-              url,
-              title: extractedTitle,
-              content: extractedContent,
-              isFullContent,
-            });
+            pageContents.push({ url, title: extractedTitle, content: extractedContent, isFullContent });
           }
         }
       } catch {
-        // Page read failure — try using snippet as fallback
         const snippet = result.snippet || '';
         if (snippet.length > 0) {
-          pageContents.push({
-            url,
-            title: result.title || url,
-            content: `[Resumo da página]: ${snippet}`,
-            isFullContent: false,
-          });
+          pageContents.push({ url, title: result.title || url, content: `[Resumo da página]: ${snippet}`, isFullContent: false });
         }
       }
     }
 
-    // If we have no page content but have search snippets, add remaining snippets
     if (pageContents.length === 0) {
       for (const result of searchResults.slice(0, 8)) {
         const url = result.url;
         if (!url || !url.includes('documentacao.senior.com.br')) continue;
         const snippet = result.snippet || result.title || '';
         if (snippet.length > 0) {
-          pageContents.push({
-            url,
-            title: result.title || url,
-            content: `[Resumo da página]: ${snippet}`,
-            isFullContent: false,
-          });
+          pageContents.push({ url, title: result.title || url, content: `[Resumo da página]: ${snippet}`, isFullContent: false });
         }
       }
     }
 
-    // ----------------------------------------------------------
     // Step 6: Build context and generate answer
-    // ----------------------------------------------------------
     const context = pageContents
       .map((p, i) => {
         const tag = p.isFullContent ? 'Conteúdo completo' : 'Resumo/snippet';
@@ -359,9 +287,7 @@ export async function POST(request: NextRequest) {
       .join('\n\n---\n\n');
 
     const hasContext = context.trim().length > 0;
-    const finalContext = hasContext
-      ? context
-      : 'Nenhuma documentação foi encontrada para esta pergunta.';
+    const finalContext = hasContext ? context : 'Nenhuma documentação foi encontrada para esta pergunta.';
 
     let answer = '';
     try {
@@ -374,102 +300,52 @@ export async function POST(request: NextRequest) {
       });
       answer = answerResult.choices?.[0]?.message?.content || '';
     } catch {
-      answer =
-        'Com base na documentação Senior... Não foi possível gerar uma resposta no momento. Por favor, tente novamente.';
+      answer = '**Resposta direta:** Não foi possível gerar uma resposta no momento. Por favor, tente novamente.\n\n**Confiança:** Baixa';
     }
 
-    // ----------------------------------------------------------
     // Step 7: Assess confidence
-    // ----------------------------------------------------------
     const confidence = assessConfidence(
       pageContents.map((p) => ({ url: p.url, snippet: p.content.slice(0, 200), isFullContent: p.isFullContent })),
       intent
     );
 
-    // ----------------------------------------------------------
-    // Step 8: Extract gaps from answer
-    // ----------------------------------------------------------
+    // Step 8: Extract gaps
     let gaps: string[] = [];
-    if (confidence === 'low' || pageContents.length === 0) {
-      gaps.push('Nenhuma documentação relevante foi encontrada');
-    }
-    if (intent === 'unrelated') {
-      gaps.push('Pergunta fora do escopo da documentação Senior');
-    }
-    if (pageContents.length > 0 && pageContents.length < 3) {
-      gaps.push('Poucas fontes encontradas — a resposta pode ser incompleta');
-    }
+    if (confidence === 'low' || pageContents.length === 0) gaps.push('Nenhuma documentação relevante foi encontrada');
+    if (intent === 'unrelated') gaps.push('Pergunta fora do escopo da plataforma Senior');
+    if (pageContents.length > 0 && pageContents.length < 3) gaps.push('Poucas fontes encontradas — a resposta pode ser incompleta');
     const snippetOnlySources = pageContents.filter(p => !p.isFullContent);
     if (snippetOnlySources.length > 0 && snippetOnlySources.length === pageContents.length) {
-      gaps.push('Apenas resumos das páginas foram encontrados (leitura completa indisponível) — recomenda-se consultar os links diretamente');
+      gaps.push('Apenas resumos das páginas foram encontrados — recomenda-se consultar os links diretamente');
     }
 
-    // ----------------------------------------------------------
     // Step 9: Save to database
-    // ----------------------------------------------------------
-    // Create or find session
     let session;
-    if (sessionId) {
-      session = await db.warRoomSession.findUnique({
-        where: { id: sessionId },
-      });
-    }
-
+    if (sessionId) session = await db.warRoomSession.findUnique({ where: { id: sessionId } });
     if (!session) {
-      // Auto-generate title from first message
       let title = message.slice(0, 60);
       if (message.length > 60) title += '...';
-      session = await db.warRoomSession.create({
-        data: {
-          title,
-        },
-      });
+      session = await db.warRoomSession.create({ data: { title } });
     }
 
-    // Save user message
     const userMessage = await db.warRoomMessage.create({
-      data: {
-        sessionId: session.id,
-        role: 'user',
-        content: message,
-        intent,
-        product: keyTerms.product || null,
-        module: keyTerms.module || null,
-      },
+      data: { sessionId: session.id, role: 'user', content: message, intent, product: keyTerms.product || null, module: keyTerms.module || null },
     });
 
-    // Save assistant message
     const assistantMessage = await db.warRoomMessage.create({
-      data: {
-        sessionId: session.id,
-        role: 'assistant',
-        content: answer,
-        intent,
-        confidence,
-        product: keyTerms.product || null,
-        module: keyTerms.module || null,
-      },
+      data: { sessionId: session.id, role: 'assistant', content: answer, intent, confidence, product: keyTerms.product || null, module: keyTerms.module || null },
     });
 
-    // Save sources linked to assistant message
     const sourceRecords = [];
     for (let i = 0; i < pageContents.length; i++) {
       const page = pageContents[i];
       const source = await db.warRoomSource.create({
-        data: {
-          messageId: assistantMessage.id,
-          title: page.title,
-          url: page.url,
-          snippet: page.content.slice(0, 500),
-          relevance: 1 - i * 0.15, // Decrease relevance for lower-ranked results
-        },
+        data: { messageId: assistantMessage.id, title: page.title, url: page.url, snippet: page.content.slice(0, 500), relevance: 1 - i * 0.15 },
       });
       sourceRecords.push(source);
     }
 
-    // ----------------------------------------------------------
     // Step 10: Return structured response
-    // ----------------------------------------------------------
     return NextResponse.json({
       sessionId: session.id,
       userMessageId: userMessage.id,
@@ -479,19 +355,12 @@ export async function POST(request: NextRequest) {
       confidence,
       keyTerms,
       sources: sourceRecords.map((s) => ({
-        id: s.id,
-        title: s.title,
-        url: s.url,
-        snippet: s.snippet,
-        relevance: s.relevance,
+        id: s.id, title: s.title, url: s.url, snippet: s.snippet, relevance: s.relevance,
       })),
       gaps,
     });
   } catch (error) {
     console.error('[War Room Chat Error]', error);
-    return NextResponse.json(
-      { error: 'Internal server error in War Room chat' },
-      { status: 500 }
-    );
+    return NextResponse.json({ error: 'Internal server error in War Room chat' }, { status: 500 });
   }
 }
