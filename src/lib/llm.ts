@@ -60,7 +60,8 @@ export async function chatCompletion(params: ChatCompletionParams): Promise<Chat
         Authorization: `Bearer ${apiKey}`,
       },
       body: JSON.stringify(body),
-      signal: AbortSignal.timeout(Number(process.env.DEEPSEEK_TIMEOUT_MS || 180_000)),
+      // Number(env) || default evita NaN quando a env for string invalida (ex: 'undefined', '')
+      signal: AbortSignal.timeout(Number(process.env.DEEPSEEK_TIMEOUT_MS) || 180_000),
     });
 
     if (!response.ok) {
@@ -73,5 +74,10 @@ export async function chatCompletion(params: ChatCompletionParams): Promise<Chat
 
   // Local/dev fallback while DEEPSEEK_API_KEY is not configured.
   const zai = await ZAI.create();
-  return zai.chat.completions.create(params as never) as Promise<ChatCompletionResponse>;
+  const normalizedParams = {
+    ...params,
+    messages: normalizeMessages(params.messages || []),
+  };
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  return zai.chat.completions.create(normalizedParams as any) as Promise<ChatCompletionResponse>;
 }
