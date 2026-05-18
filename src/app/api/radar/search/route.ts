@@ -116,7 +116,7 @@ Responda EXATAMENTE no formato JSON (sem markdown, sem code blocks):
     const completion = await zai.chat.completions.create({
       messages: [
         {
-          role: 'system',
+          role: 'assistant',
           content: 'Você é um analista de inteligência competitiva. Sempre responda em JSON válido.',
         },
         {

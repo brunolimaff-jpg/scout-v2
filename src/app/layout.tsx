@@ -15,9 +15,9 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "Senior Scout 360 — Inteligência de Documentação",
-  description: "Plataforma de inteligência para documentação Senior, investigação de empresas, inteligência competitiva e gestão de contas.",
-  keywords: ["Senior", "Scout", "ERP", "Documentação", "CRM", "Inteligência Competitiva"],
+  title: "Senior Scout 360 — Inteligência Comercial",
+  description: "Plataforma de inteligência comercial Senior. Investigue empresas, consulte documentação, monitore o mercado e gerencie contas.",
+  keywords: ["Senior", "Scout", "ERP", "Comercial", "CRM", "Inteligência Competitiva", "Vendas"],
   authors: [{ name: "Senior Scout 360" }],
   icons: {
     icon: "https://z-cdn.chatglm.cn/z-ai/static/logo.svg",

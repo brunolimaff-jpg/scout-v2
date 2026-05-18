@@ -49,6 +49,7 @@ import {
   MessageSquareQuote,
   Shield,
   RefreshCw,
+  Users,
 } from 'lucide-react'
 import { toast } from 'sonner'
 
@@ -201,8 +202,12 @@ function useSSEInvestigation() {
       })
 
       if (!response.ok) {
-        const errorData = await response.json().catch(() => ({}))
-        throw new Error(errorData.error || 'Erro na investigação')
+        let errorMsg = 'Erro na investigação'
+        try {
+          const errorData = await response.json().catch(() => ({}))
+          errorMsg = errorData.error || errorData.details || `Erro ${response.status}: ${response.statusText}`
+        } catch { /* use default error */ }
+        throw new Error(errorMsg)
       }
 
       const contentType = response.headers.get('content-type') || ''
@@ -249,8 +254,14 @@ function useSSEInvestigation() {
     } catch (err) {
       if (err instanceof Error && err.name === 'AbortError') {
         setError({ type: 'cancelled', message: 'Investigação cancelada pelo usuário.' })
+      } else if (err instanceof TypeError && err.message.includes('fetch')) {
+        setError({ type: 'no_internet', message: 'Sem conexão com o servidor. Verifique sua internet e tente novamente.' })
       } else {
-        setError({ type: 'unknown', message: err instanceof Error ? err.message : 'Erro na investigação' })
+        const msg = err instanceof Error ? err.message : 'Erro na investigação'
+        const errorType = msg.toLowerCase().includes('timeout') ? 'timeout' as const
+          : msg.toLowerCase().includes('network') || msg.toLowerCase().includes('failed to fetch') ? 'no_internet' as const
+          : 'unknown' as const
+        setError({ type: errorType, message: msg })
       }
       setIsLoading(false)
       if (timerRef.current) clearInterval(timerRef.current)
@@ -429,6 +440,34 @@ export function ScoutView() {
     } catch { toast.error('Erro ao excluir investigação') }
   }
 
+  const addToCrm = async () => {
+    if (!selectedInvestigation) return
+    try {
+      const res = await fetch('/api/crm/accounts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          companyName: selectedInvestigation.companyName,
+          cnpj: selectedInvestigation.cnpj || undefined,
+          sector: selectedInvestigation.sector || undefined,
+          stage: 'lead',
+          investigationId: selectedInvestigation.id,
+          notes: `Adicionado via Scout. Score PORTA: ${selectedInvestigation.portaScore?.total?.toFixed(1) || 'N/A'}`,
+        }),
+      })
+      if (res.ok) {
+        toast.success('Conta adicionada ao CRM!')
+      } else {
+        const data = await res.json().catch(() => ({}))
+        if (data.error?.includes('already exists')) {
+          toast.info('Esta empresa já está no CRM')
+        } else {
+          toast.error(data.error || 'Erro ao adicionar ao CRM')
+        }
+      }
+    } catch { toast.error('Erro ao adicionar ao CRM') }
+  }
+
   const viewInvestigation = async (id: string) => {
     try {
       const res = await fetch(`/api/scout/investigations/${id}`)
@@ -569,6 +608,12 @@ export function ScoutView() {
                         <Badge variant="outline" className="text-xs text-emerald-600 dark:text-emerald-400">
                           {SUB_SECTOR_LABELS[selectedInvestigation.subSector] || selectedInvestigation.subSector}
                         </Badge>
+                      )}
+                      {selectedInvestigation.status === 'completed' && (
+                        <Button variant="outline" size="sm" className="text-xs h-7" onClick={addToCrm}>
+                          <Users className="h-3 w-3 mr-1" />
+                          Add to CRM
+                        </Button>
                       )}
                     </div>
                   </div>

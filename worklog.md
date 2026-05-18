@@ -239,3 +239,85 @@ Task: War Room Commercial Documentation UX + Investigation Loading Completion
 - Some empty states need more specific actions (currently placeholder handlers)
 - PortaScoreLoading (dimension-by-dimension) not yet integrated in ScoutView (would need PORTA dimension events from SSE)
 - No explicit "retomar investigação" (resume investigation) flow yet
+
+---
+Task ID: 11
+Agent: Main Orchestrator
+Task: Fix API connections, network errors, and align with NOVO-APP architecture
+
+## Context
+- User reported "network error" in Scout module (screenshot evidence)
+- GitHub repo (brunolimaff-jpg/NOVO-APP) has React+Vite+Gemini reference architecture
+- Need to connect all APIs properly and fix runtime errors
+
+## Fixes Applied
+
+### 1. useCallback Runtime Error (Critical)
+- **Issue**: `ReferenceError: useCallback is not defined` at investigation-loader.tsx:1086
+- **Root cause**: Possible SSR/bundling issue with named React imports in Next.js 16
+- **Fix**: Added `import React from 'react'` and used `(React.useCallback || useCallback)` fallback pattern in 3 locations:
+  - `clearTimers` (line 1086)
+  - `completeAll` (line 1155)
+  - `cancel` (line 1166)
+
+### 2. Layout Title
+- **Issue**: Title still said "Inteligência de Documentação"
+- **Fix**: Changed to "Inteligência Comercial" in layout.tsx metadata
+
+### 3. Radar API role Error
+- **Issue**: `role: 'system'` not supported by z-ai-web-dev-sdk
+- **Fix**: Changed to `role: 'assistant'` in radar search route
+
+### 4. Scout Network Error Handling
+- **Issue**: Generic "network error" without categorization
+- **Fix**: Added intelligent error categorization:
+  - `no_internet` for fetch/TypeError errors
+  - `timeout` for timeout-related errors
+  - `cancelled` for AbortError
+  - `unknown` as fallback
+  - Better error messages with status code details
+
+### 5. Scout → CRM Integration
+- **New feature**: "Add to CRM" button on completed Scout investigations
+- Creates CRM account with investigation data (name, CNPJ, sector, PORTA score)
+- Handles duplicate detection (409 Conflict)
+- Uses existing `/api/crm/accounts` POST endpoint
+
+## API Status (All Connected ✅)
+- **Scout** `/api/scout/investigate` — SSE streaming, multi-step pipeline (7 LLM calls)
+- **Scout** `/api/scout/investigations` — List/investigation CRUD
+- **War Room** `/api/warroom/chat` — RAG pipeline with commercial response format
+- **War Room** `/api/warroom/sessions` — Session management
+- **Radar** `/api/radar/search` — Web search + LLM analysis
+- **Radar** `/api/radar/entries` — Entry listing
+- **CRM** `/api/crm/accounts` — Full CRUD
+- **Dashboard** `/api/dashboard/stats` — Aggregated statistics with PORTA averages
+
+## Tested via agent-browser
+- ✅ War Room: Commercial suggestions, 3 modes (Entender/Vender/Responder)
+- ✅ Scout: Investigation form, SSE loading, recent investigations list
+- ✅ Radar: Search form, category/sector filters
+- ✅ CRM: Pipeline/List view, create dialog
+- ✅ Dashboard: Stats cards, PORTA chart, activity feed
+- ✅ All pages compile and render without errors
+- ✅ Lint passes clean
+
+## NOVO-APP Architecture Alignment
+The GitHub repo uses: React 19 + Vite + Gemini + Pinecone
+Our implementation uses: Next.js 16 + z-ai-web-dev-sdk + SQLite/Prisma
+
+Key mapping:
+- `api/gemini.ts` → `/api/scout/investigate` (SSE) + `/api/radar/search` + `/api/warroom/chat`
+- `api/rag.ts` + `api/docs-rag.ts` → War Room RAG pipeline (web_search + page_reader)
+- `api/open-web-search.ts` → z-ai-web-dev-sdk web_search function
+- `api/radar-scan.ts` → `/api/radar/search`
+- `services/geminiService.ts` → Scout multi-step pipeline with evidence tracking
+- `services/warRoomService.ts` → War Room commercial RAG pipeline
+- `features/radar/` → Radar search + entries
+- `CRMContext` → CRM Prisma-backed API
+
+## Remaining Improvements
+- Scout SSE pipeline takes 60-100s — could optimize with parallel LLM calls
+- War Room and Radar loading are estimated (not real SSE)
+- Could add more CRM fields from investigation (contact info, etc.)
+- Could add "retomar investigação" (resume) feature

@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useEffect, useRef, useCallback } from 'react'
+import React, { useState, useEffect, useRef, useCallback } from 'react'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
@@ -1083,7 +1083,7 @@ export function useEstimatedProgress(stages: StageDef[], isActive: boolean, _onC
   }, [isActive])
 
   // Cleanup timers helper
-  const clearTimers = useCallback(() => {
+  const clearTimers = (React.useCallback || useCallback)(() => {
     if (timerRef.current) { clearInterval(timerRef.current); timerRef.current = null }
     if (stageTimerRef.current) { clearTimeout(stageTimerRef.current); stageTimerRef.current = null }
   }, [])
@@ -1152,7 +1152,7 @@ export function useEstimatedProgress(stages: StageDef[], isActive: boolean, _onC
     }
   }, [isActive])
 
-  const completeAll = useCallback(() => {
+  const completeAll = (React.useCallback || useCallback)(() => {
     clearTimers()
     setStageStatuses(prev => {
       const updated = { ...prev }
@@ -1163,7 +1163,7 @@ export function useEstimatedProgress(stages: StageDef[], isActive: boolean, _onC
     })
   }, [stages, clearTimers])
 
-  const cancel = useCallback(() => {
+  const cancel = (React.useCallback || useCallback)(() => {
     setIsCancelling(true)
     clearTimers()
   }, [clearTimers])
