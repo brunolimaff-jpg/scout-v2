@@ -83,12 +83,28 @@ export async function POST(request: NextRequest) {
     if (investigationId) {
       const investigation = await db.scoutInvestigation.findUnique({
         where: { id: investigationId },
+        include: { portaScore: true },
       });
 
       if (!investigation) {
         return NextResponse.json(
           { error: 'Investigation not found' },
           { status: 404 }
+        );
+      }
+
+      // Block CRM creation from non-completed or completed-without-PORTA investigations
+      if (investigation.status !== 'completed') {
+        return NextResponse.json(
+          { error: 'Cannot create CRM account from a non-completed investigation. The investigation must be completed first.' },
+          { status: 400 }
+        );
+      }
+
+      if (!investigation.portaScore) {
+        return NextResponse.json(
+          { error: 'Cannot create CRM account from an investigation without a PORTA score. The investigation must have a validated score.' },
+          { status: 400 }
         );
       }
 

@@ -29,6 +29,15 @@ import {
 } from 'lucide-react'
 
 // ============================================================
+// UNIQUE ID COUNTER
+// ============================================================
+
+let _tickerCounter = 0
+function nextTickerId(prefix: string): string {
+  return `${prefix}-${++_tickerCounter}`
+}
+
+// ============================================================
 // TYPES
 // ============================================================
 
@@ -289,9 +298,17 @@ function EvidenceTicker({ items }: { items: TickerItem[] }) {
 
   if (items.length === 0) return null
 
+  // Deduplicate items by ID, keeping only the first occurrence
+  const seen = new Set<string>()
+  const deduped = items.filter(item => {
+    if (seen.has(item.id)) return false
+    seen.add(item.id)
+    return true
+  })
+
   return (
     <div ref={scrollRef} className="max-h-28 overflow-y-auto space-y-1 scrollbar-thin">
-      {items.map((item) => {
+      {deduped.map((item) => {
         const Icon = TICKER_ICONS[item.type] || Eye
         return (
           <div
@@ -1118,7 +1135,7 @@ export function useEstimatedProgress(stages: StageDef[], isActive: boolean, _onC
       setStageStatuses(prev => ({ ...prev, [stage.id]: 'active' }))
       setCurrentStageId(stage.id)
       setTickerItems(prev => [...prev, {
-        id: `ticker-${stage.id}-${Date.now()}`,
+        id: nextTickerId(`ticker-${stage.id}`),
         message: stage.microcopy,
         type: 'info',
         timestamp: Date.now(),
@@ -1129,7 +1146,7 @@ export function useEstimatedProgress(stages: StageDef[], isActive: boolean, _onC
       stageTimerRef.current = setTimeout(() => {
         setStageStatuses(prev => ({ ...prev, [stage.id]: 'completed' }))
         setTickerItems(prev => [...prev, {
-          id: `ticker-${stage.id}-done-${Date.now()}`,
+          id: nextTickerId(`ticker-${stage.id}-done`),
           message: `${stage.label} ✓`,
           type: 'found',
           timestamp: Date.now(),
@@ -1313,7 +1330,7 @@ export function useSSEInvestigation() {
         setCurrentStageId(event.stageId || null)
         if (event.message) {
           setTickerItems(prev => [...prev, {
-            id: `ticker-${event.stageId}-${Date.now()}`,
+            id: nextTickerId(`ticker-${event.stageId}`),
             message: event.message || '',
             type: 'info',
             timestamp: Date.now(),
@@ -1324,7 +1341,7 @@ export function useSSEInvestigation() {
       case 'progress_stage_completed':
         setStageStatuses(prev => ({ ...prev, [event.stageId || '']: 'completed' }))
         setTickerItems(prev => [...prev, {
-          id: `ticker-${event.stageId}-done-${Date.now()}`,
+          id: nextTickerId(`ticker-${event.stageId}-done`),
           message: `${event.label || event.stageId} ✓`,
           type: 'found',
           timestamp: Date.now(),
@@ -1335,7 +1352,7 @@ export function useSSEInvestigation() {
         setStageStatuses(prev => ({ ...prev, [event.stageId || '']: 'warning' }))
         if (event.message) {
           setTickerItems(prev => [...prev, {
-            id: `ticker-${event.stageId}-warn-${Date.now()}`,
+            id: nextTickerId(`ticker-${event.stageId}-warn`),
             message: event.message as string,
             type: 'warning' as const,
             timestamp: Date.now(),
@@ -1347,7 +1364,7 @@ export function useSSEInvestigation() {
         setStageStatuses(prev => ({ ...prev, [event.stageId || '']: 'failed' }))
         if (event.message) {
           setTickerItems(prev => [...prev, {
-            id: `ticker-${event.stageId}-fail-${Date.now()}`,
+            id: nextTickerId(`ticker-${event.stageId}-fail`),
             message: event.message as string,
             type: 'error' as const,
             timestamp: Date.now(),
@@ -1362,7 +1379,7 @@ export function useSSEInvestigation() {
 
       case 'evidence_found':
         setTickerItems(prev => [...prev, {
-          id: `evidence-${Date.now()}-${Math.random()}`,
+          id: nextTickerId('evidence'),
           message: event.message || 'Evidência encontrada',
           type: 'found',
           timestamp: Date.now(),
@@ -1401,12 +1418,6 @@ export function useSSEInvestigation() {
         if (event.confidence !== undefined) {
           const level: ConfidenceLevel = event.confidence >= 0.7 ? 'alta' : event.confidence >= 0.4 ? 'média' : 'baixa'
           setConfidence(level)
-        }
-        break
-
-      case 'partial_result_available':
-        if (event.metadata) {
-          setResult(prev => ({ ...prev, ...event.metadata }))
         }
         break
 

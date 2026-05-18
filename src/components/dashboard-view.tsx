@@ -30,6 +30,7 @@ import {
 
 interface DashboardStats {
   totalInvestigations: number
+  completedInvestigations: number
   statusBreakdown: Record<string, number>
   avgPortaScore: number
   portaAverages: {
@@ -181,7 +182,10 @@ export function DashboardView() {
                   <Search className="h-4 w-4 text-emerald-500" />
                   <p className="text-xs text-muted-foreground">Investigações</p>
                 </div>
-                <p className="text-2xl font-bold">{stats.totalInvestigations}</p>
+                <p className="text-2xl font-bold">{stats.completedInvestigations}</p>
+                <p className="text-[10px] text-muted-foreground mt-0.5">
+                  {stats.completedInvestigations} concluídas de {stats.totalInvestigations} total
+                </p>
                 {stats.statusBreakdown && (
                   <div className="flex flex-wrap gap-1 mt-1">
                     {Object.entries(stats.statusBreakdown).map(([status, count]) => (

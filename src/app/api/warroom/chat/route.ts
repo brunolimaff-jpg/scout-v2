@@ -164,7 +164,11 @@ export async function POST(request: NextRequest) {
       });
       const rawTerms = termsResult.choices?.[0]?.message?.content?.trim() || '{}';
       const jsonStr = rawTerms.replace(/```json?\n?/g, '').replace(/```/g, '').trim();
-      keyTerms = JSON.parse(jsonStr);
+      const parsed = JSON.parse(jsonStr);
+      // Ensure all values are strings or null (LLM might return objects)
+      for (const [k, v] of Object.entries(parsed)) {
+        keyTerms[k] = typeof v === 'string' ? v : null;
+      }
     } catch {
       keyTerms = {};
     }
@@ -332,12 +336,18 @@ export async function POST(request: NextRequest) {
       session = await db.warRoomSession.create({ data: { title } });
     }
 
+    // Sanitize values for Prisma — ensure all fields are the correct type
+    const safeProduct = typeof keyTerms.product === 'string' ? keyTerms.product : null;
+    const safeModule = typeof keyTerms.module === 'string' ? keyTerms.module : null;
+    const safeIntent = typeof intent === 'string' ? intent : null;
+    const safeConfidence = (typeof confidence === 'string' && ['high', 'medium', 'low'].includes(confidence)) ? confidence : null;
+
     const userMessage = await db.warRoomMessage.create({
-      data: { sessionId: session.id, role: 'user', content: message, intent, product: keyTerms.product || null, module: keyTerms.module || null },
+      data: { sessionId: session.id, role: 'user', content: message, intent: safeIntent, product: safeProduct, module: safeModule },
     });
 
     const assistantMessage = await db.warRoomMessage.create({
-      data: { sessionId: session.id, role: 'assistant', content: answer, intent, confidence, product: keyTerms.product || null, module: keyTerms.module || null },
+      data: { sessionId: session.id, role: 'assistant', content: answer, intent: safeIntent, confidence: safeConfidence, product: safeProduct, module: safeModule },
     });
 
     const sourceRecords: Array<{ id: string; title: string; url: string; snippet: string; relevance: number }> = [];

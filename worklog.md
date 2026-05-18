@@ -398,3 +398,262 @@ Limitações restantes:
 - DuckDuckGo not directly accessible as separate API — fallback uses alternative query formulations via web_search
 - Some LLM responses may still vary in JSON format (mitigated with robust extraction)
 - No authentication — any user can access any data
+
+---
+Task ID: 5+6+10+11
+Agent: Main Orchestrator
+Task: Fix Data Integrity — Invalid completed investigations, Dashboard counts, CRM guard, failed investigation UX
+
+## Problems Fixed
+
+### 1. Invalid "completed" investigations without real evidence
+- Old/legacy investigations could have status "completed" with no summary, sources, or evidences
+- These showed up in Recent Investigations as "Concluída" with a PORTA Score even though they're invalid
+
+**Fix**: 
+- Added one-time cleanup script via `POST /api/scout/investigations` endpoint
+- Marks investigations as 'failed' if they are 'completed' but have no summary AND no sources AND no evidences
+- Deletes orphaned PortaScore records linked to non-completed investigations
+- Deletes CrmAccount records linked to failed investigations
+- Ran cleanup on existing DB — no invalid records found in current data (all 7 investigations have valid summary + sources)
+
+### 2. Dashboard counts including failed/pending investigations
+- `totalInvestigations` counted ALL statuses including failed ones
+- `avgPortaScore` averaged ALL scores including those from non-completed investigations
+- PORTA dimension averages included scores from all investigations
+
+**Fix**: 
+- Dashboard stats API now returns `completedInvestigations` count separately from `totalInvestigations`
+- `avgPortaScore` only averages scores from completed investigations (added `where: { investigation: { status: 'completed' } }`)
+- PORTA dimension averages only computed from completed investigations
+- Dashboard UI updated to show "X concluídas de Y total" instead of just the total number
+
+### 3. CRM accounts could be created from failed investigations
+- "Add to CRM" button appeared whenever `selectedInvestigation.status === 'completed'`
+- No check for portaScore existence
+- CRM API endpoint had no server-side validation
+
+**Fix**: 
+- Scout view: Button now only appears if `status === 'completed' && portaScore` (line 644)
+- `addToCrm()` function: Early return if not completed or no portaScore (line 476)
+- CRM API POST: Added server-side validation that rejects accounts from non-completed investigations AND from completed investigations without a PORTA score (lines 96-109)
+
+### 4. Failed investigation cards UX
+- Already had "Falhou" badge and "Tentar novamente" button in card list (lines 904-913)
+- Missing: retry action in the selected investigation detail view
+- Missing: explicit failed investigation banner
+
+**Fix**: 
+- Added retry banner card for failed investigations in detail view (lines 685-707)
+  - Shows "Investigação falhou" with explanation
+  - "Tentar novamente" button that pre-fills company name and clears selection
+- PORTA score display now explicitly guards on `status === 'completed' && portaScore` (line 710)
+  - Was previously `portaScore` only — now also checks status
+
+### 5. Investigations API data integrity
+- List endpoint returned portaScore for all investigations regardless of status
+
+**Fix**: 
+- `GET /api/scout/investigations`: Strips portaScore from non-completed investigations in response
+- Added portaScore where filter: `{ investigation: { status: 'completed' } }` in include
+
+### 6. Investigation detail API error states
+- Detail endpoint returned raw data with no context about failed/pending state
+
+**Fix**: 
+- `GET /api/scout/investigations/[id]`: Returns `errorState` object for failed/pending/investigating statuses
+- Failed: `{ type: 'insufficient_evidence', message: '...', canRetry: true }`
+- Pending/Investigating: `{ type: 'in_progress', message: '...', canRetry: false }`
+- Strips portaScore from non-completed investigations
+
+## Files Modified
+- `src/app/api/dashboard/stats/route.ts` — Only count completed investigations for PORTA averages, added completedInvestigations count
+- `src/app/api/scout/investigations/route.ts` — Data integrity filter + POST cleanup endpoint
+- `src/app/api/scout/investigations/[id]/route.ts` — Error state context for non-completed, strip portaScore
+- `src/app/api/crm/accounts/route.ts` — Server-side validation: block CRM creation from non-completed/no-PORTA investigations
+- `src/components/scout-view.tsx` — CRM button guard (completed + portaScore), failed retry banner, PORTA display guard
+- `src/components/dashboard-view.tsx` — Added completedInvestigations type, show "X concluídas de Y total"
+
+## Key Principle Enforced
+**No completed status without real evidence.** The system now has multiple layers of protection:
+1. **Database level**: Cleanup script catches legacy invalid records
+2. **API level**: List/detail endpoints strip portaScore from non-completed investigations
+3. **CRM API level**: Server-side validation blocks account creation from invalid investigations
+4. **UI level**: CRM button and PORTA display only appear for completed+scored investigations
+5. **Dashboard level**: Stats only count completed investigations and their scores
+
+---
+Task ID: 2
+Agent: Code Fix Agent
+Task: Fix React duplicate key warnings in EvidenceTicker component
+
+## Problem
+EvidenceTicker component generated React duplicate key warnings because ticker item IDs were based on `Date.now()` which returns the same value for multiple events in the same render cycle, and `Math.random()` which could collide. This occurred in:
+- `useEstimatedProgress` hook in investigation-loader.tsx (2 locations)
+- `useSSEInvestigation` hook in investigation-loader.tsx (5 locations)
+- `useSSEInvestigation` hook in scout-view.tsx (4 locations)
+- War Room message IDs in war-room-view.tsx (2 locations)
+
+## Changes Made
+
+### 1. investigation-loader.tsx
+- Added module-level counter `_tickerCounter` and `nextTickerId()` function at the top of the file
+- Replaced all `Date.now()` based IDs in `useEstimatedProgress` hook:
+  - `id: \`ticker-${stage.id}-${Date.now()}\`` → `id: nextTickerId(\`ticker-${stage.id}\`)`
+  - `id: \`ticker-${stage.id}-done-${Date.now()}\`` → `id: nextTickerId(\`ticker-${stage.id}-done\`)`
+- Replaced all `Date.now()` based IDs in `useSSEInvestigation` hook:
+  - `id: \`ticker-${event.stageId}-${Date.now()}\`` → `id: nextTickerId(\`ticker-${event.stageId}\`)`
+  - `id: \`ticker-${event.stageId}-done-${Date.now()}\`` → `id: nextTickerId(\`ticker-${event.stageId}-done\`)`
+  - `id: \`ticker-${event.stageId}-warn-${Date.now()}\`` → `id: nextTickerId(\`ticker-${event.stageId}-warn\`)`
+  - `id: \`ticker-${event.stageId}-fail-${Date.now()}\`` → `id: nextTickerId(\`ticker-${event.stageId}-fail\`)`
+  - `id: \`evidence-${Date.now()}-${Math.random()}\`` → `id: nextTickerId('evidence')`
+- Removed dead `partial_result_available` switch case (lines 1407-1411) — this event type was never emitted by the backend
+- Added deduplication in `EvidenceTicker` component: filters out duplicate IDs before rendering, keeping only the first occurrence using a Set
+
+### 2. scout-view.tsx
+- Added module-level counter `_sseEventCounter` and `nextSSEId()` function
+- Replaced all `Date.now()` based IDs in `handleEvent` function:
+  - `id: \`t-${event.stageId}-${Date.now()}\`` → `id: nextSSEId(\`t-${event.stageId}\`)`
+  - `id: \`t-${event.stageId}-done-${Date.now()}\`` → `id: nextSSEId(\`t-${event.stageId}-done\`)`
+  - `id: \`t-${event.stageId}-warn-${Date.now()}\`` → `id: nextSSEId(\`t-${event.stageId}-warn\`)`
+  - `id: \`ev-${Date.now()}-${Math.random()}\`` → `id: nextSSEId('ev')`
+
+### 3. war-room-view.tsx
+- Added module-level counter `_warRoomMsgCounter` and `nextMsgId()` function
+- Replaced `Date.now()` based message IDs:
+  - `id: \`temp-user-${Date.now()}\`` → `id: nextMsgId('temp-user')`
+  - `id: data.assistantMessageId || \`temp-asst-${Date.now()}\`` → `id: data.assistantMessageId || nextMsgId('temp-asst')`
+
+### 4. radar-view.tsx
+- No `Date.now()` based IDs found — no changes needed
+
+## Verification
+- ESLint passes clean with no errors
+- No visual appearance or functionality changes — only ID generation logic updated
+- Counter-based IDs guarantee uniqueness within a module (monotonically increasing)
+- Deduplication in EvidenceTicker provides a safety net against any remaining edge cases
+
+---
+Task ID: 3
+Agent: SSE Error Handling Fix Agent
+Task: Fix SSE stream crash, client-side parsing, and loading stuck issues
+
+## Root Causes Identified
+
+1. **Backend SSE stream crashes silently** — If ZAI SDK throws during research, the error was caught but the SSE stream could hang (no `final_response_ready` sent). The `controller.close()` was in a `finally` block, but the client never knew the stream ended abnormally.
+
+2. **Client-side SSE parsing doesn't handle partial chunks** — If the stream ends abruptly, the last partial event was lost and no error was shown to the user.
+
+3. **Generic "network error" in scout-view.tsx** — The catch block didn't distinguish between: fetch failure, SSE stream error, stream ended without `final_response_ready`, user abort, etc.
+
+4. **War Room gets stuck in loading** — `useEstimatedProgress` hook auto-completes stages on a timer, but if the API call itself fails, `completeAll()` was called before checking the response, so the loading indicator kept going even on error.
+
+5. **Radar has the same loading stuck issue** — `completeAll()` was called before parsing the response, and `cancelProgress()` was never called on error.
+
+## Changes Made
+
+### 1. `src/app/api/scout/investigate/route.ts` — Backend SSE Pipeline
+
+- **runId for traceability**: Every SSE event now includes the `runId` (investigation.id) so client can track which run each event belongs to
+- **run_started event**: New `run_started` event emitted at the beginning with `{ runId, companyName }`
+- **Heartbeat mechanism**: If >10 seconds pass between events, a `warning` event is sent to the client: "Pipeline em andamento — aguardando resposta do provedor..."
+- **ZAI.create() fail safety**: Wrapped in its own try-catch. If it fails, the stream sends `progress_stage_failed` + `final_response_ready` with `error: true` and returns immediately — the stream doesn't hang.
+- **Per-stage error handling**: Every pipeline stage (classifyCompany, extractEvidence, searchCompetition, generatePortaScore, generateSummary, generateCommercialThesis, qualityCheck) is now wrapped in individual try-catch blocks:
+  - Critical stages (classification, evidence): On error → `markInvestigationFailed()`, send `final_response_ready` with error, and RETURN
+  - Non-critical stages (competition, PORTA, summary, thesis, QC): On error → `sendStageWarning()` and continue with degraded result
+  - DB save failure: Also treated as critical failure
+- **Structured console.error logging**: Every catch block now logs with `{ runId, stage, error }` object for structured log analysis
+- **markInvestigationFailed() with stage param**: Now accepts optional `stage` parameter, stored in `rawData` JSON alongside the error reason and timestamp
+- **finally block guarantees**: `clearInterval(heartbeatInterval)` + `controller.close()` + `closed = true` always called in finally, even if sends fail
+- **Outer catch is defensive**: `send()` calls in the outer catch are wrapped in try-catch since the stream may already be broken
+
+### 2. `src/components/scout-view.tsx` — SSE Client Handler
+
+- **Stream timeout (30s)**: If no data is received for 30 seconds, the AbortController aborts the fetch and shows: "A investigação demorou demais para responder. Tente novamente."
+- **Missing `final_response_ready` detection**: After the SSE stream ends (`done === true`), checks `receivedFinalResponseRef.current`. If no `final_response_ready` was ever received, shows: "A investigação foi interrompida antes de concluir. Tente novamente."
+- **`errorDetectedRef`**: New ref tracks whether an error was already detected via SSE events (progress_stage_failed or final_response_ready with error), so the stream-end check doesn't double-report.
+- **Better error messages — categorized**:
+  - Fetch failed (no response at all) → "Não foi possível conectar ao servidor. Verifique sua conexão." (`no_internet`)
+  - Response not SSE → "Resposta inesperada do servidor." (`api_down`)
+  - Stream ended without final_response → "A investigação foi interrompida antes de concluir. Tente novamente." (`api_down`)
+  - Abort (user cancelled) → "Investigação cancelada." (`cancelled`)
+  - Timeout (30s no data) → "A investigação demorou demais para responder. Tente novamente." (`timeout`)
+  - Non-OK HTTP response → Shows actual error from API body (`api_down`)
+- **`run_started` event handling**: Logs `runId` and `companyName` to console for traceability
+- **`warning` event handling**: Server heartbeat warnings are added to the EvidenceTicker as warning items
+- **cancel() clears stream timeout**: The cancel function now also calls `clearStreamTimeout()`
+
+### 3. `src/components/war-room-view.tsx` — Loading Stuck Fix
+
+- **45-second API timeout**: `setTimeout(() => abortController.abort(), 45_000)` ensures the fetch doesn't hang indefinitely
+- **`completeAll()` only on SUCCESS**: Moved from after `res.json()` to after the response is confirmed OK. No longer called on error paths.
+- **`cancelProgress()` on error**: In the catch block, `cancelProgress()` is called to stop the estimated progress animation immediately
+- **Actual error from API response**: `!res.ok` now parses the error body for `errorData.error || errorData.details || errorData.message || statusText` instead of throwing generic "Failed to send message"
+- **Toast shows actual error**: `toast.error(msg)` now shows the real error message from the API, not just "Erro ao consultar"
+- **clearTimeout on all paths**: Timeout is cleared both on success and in the catch block
+
+### 4. `src/components/radar-view.tsx` — Same Loading Stuck Fix
+
+- **45-second API timeout**: Same pattern as War Room
+- **`completeAll()` only on SUCCESS**: Moved to after `res.json()` is parsed, not before
+- **`cancelProgress()` on error**: Called in catch block to stop loading animation
+- **Actual error from API response**: Parses error body for details instead of generic message
+- **Toast shows actual error**: Shows the real error message
+- **clearTimeout on all paths**: Timeout cleared in success and error paths
+
+## Files Modified
+- `src/app/api/scout/investigate/route.ts` — Full rewrite of SSE pipeline with per-stage error handling, heartbeat, runId, ZAI.create() safety
+- `src/components/scout-view.tsx` — SSE handler with 30s timeout, missing final_response detection, categorized error messages, run_started/warning handlers
+- `src/components/war-room-view.tsx` — 45s timeout, completeAll only on success, cancelProgress on error, real error messages
+- `src/components/radar-view.tsx` — 45s timeout, completeAll only on success, cancelProgress on error, real error messages
+
+## Verification
+- ESLint passes clean (0 errors)
+- Dev server compiles without errors
+- No visual appearance changes — only error handling and SSE integrity fixes
+
+---
+Task ID: Hard-QA-Runtime-Integrity
+Agent: Main Orchestrator
+Task: Hard QA + Runtime Integrity Pass — Browser QA, War Room Prisma fix, final verification
+
+Work Log:
+- Ran full browser QA using agent-browser
+- Tested Scout: "SCHEFFER AGRO" investigation completed successfully in 77s with real results
+  - 18 evidences (10 facts, 3 hypotheses, 5 gaps, 0 recommendations)
+  - 20 sources consulted
+  - PORTA Score: P=8.0 O=7.0 R=6.0 T=8.0 A=7.0 with confidence levels per dimension
+  - Toast: "Investigação de SCHEFFER AGRO concluída!"
+  - Add to CRM button visible (only for completed investigations)
+- Tested War Room: "Como funciona a integração ERP Senior com HCM?"
+  - First attempt: 500 Internal Server Error (PrismaClientValidationError)
+  - Root cause: LLM keyTerms parsing could return non-string values (objects) which Prisma rejected
+  - Fix: Added type checking in keyTerms parsing (typeof v === 'string' ? v : null)
+  - Fix: Added Prisma value sanitization before DB writes (safeProduct, safeModule, safeIntent, safeConfidence)
+  - Second attempt: 200 OK in 15.7s, found 5 official sources
+- Tested Dashboard: Shows "8 concluídas de 8 total", Score PORTA Médio 7.3, proper PORTA distribution chart
+- All lint checks pass clean
+- Dev server log shows no errors in any flow
+- Closed browser session
+
+Stage Summary:
+- **Scout**: Working end-to-end with real research, evidence, and PORTA score. No network errors. No false success.
+- **War Room**: Working with real documentation search. Fixed Prisma validation error from LLM keyTerms. Shows real sources and confidence.
+- **Dashboard**: Properly counts only completed investigations for PORTA averages. Shows "X concluídas de Y total".
+- **CRM**: Guard enforced (only completed + PORTA score can add to CRM). Server-side validation in API.
+- **Radar**: Empty state when no entries (honest). Search works with real web search + LLM.
+- **Duplicate Keys**: Fixed via module-level counters replacing Date.now(). EvidenceTicker has dedup safety net.
+- **SSE Integrity**: Stream has runId, heartbeat, per-stage error handling, final_response detection on client.
+- **War Room/Radar Loading**: 45s timeout, completeAll only on success, cancelProgress on error.
+
+Real Issues Found and Fixed:
+1. War Room PrismaClientValidationError — LLM keyTerms returning non-string values
+2. War Room loading could get stuck — fixed with timeout and cancelProgress on error
+3. Radar loading could get stuck — same fix as War Room
+
+Honest Limitations:
+- War Room/Radar loading progress is estimated (not real SSE) — stages advance on timers, not actual pipeline events
+- Scout pipeline takes 60-80s due to sequential LLM calls
+- No authentication — any user can access all data
+- page_reader still times out on some documentation sites (handled with snippet fallback)
+- DuckDuckGo not available as separate API — fallback uses alternative query formulations via web_search

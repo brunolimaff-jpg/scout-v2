@@ -3,8 +3,13 @@ import { db } from '@/lib/db';
 
 export async function GET() {
   try {
-    // Total investigations
+    // Total investigations (all statuses)
     const totalInvestigations = await db.scoutInvestigation.count();
+
+    // Completed investigations count
+    const completedInvestigations = await db.scoutInvestigation.count({
+      where: { status: 'completed' },
+    });
 
     // Investigations by status
     const investigationsByStatus = await db.scoutInvestigation.groupBy({
@@ -17,8 +22,11 @@ export async function GET() {
       statusBreakdown[item.status] = item._count.status;
     }
 
-    // Average PORTA score
+    // Average PORTA score — ONLY from completed investigations
     const portaScores = await db.portaScore.findMany({
+      where: {
+        investigation: { status: 'completed' },
+      },
       select: { total: true },
     });
 
@@ -29,8 +37,8 @@ export async function GET() {
           ) / 100
         : 0;
 
-    // PORTA score dimension averages
-    const portaAverages =
+    // PORTA score dimension averages — ONLY from completed investigations
+    const portaAverages: Record<string, number> | null =
       portaScores.length > 0
         ? {
             porte: 0,
@@ -41,9 +49,11 @@ export async function GET() {
           }
         : null;
 
-    // Actually get dimension averages
     if (portaScores.length > 0) {
       const allPortaScores = await db.portaScore.findMany({
+        where: {
+          investigation: { status: 'completed' },
+        },
         select: {
           porte: true,
           operacao: true,
@@ -163,6 +173,7 @@ export async function GET() {
 
     return NextResponse.json({
       totalInvestigations,
+      completedInvestigations,
       statusBreakdown,
       avgPortaScore,
       portaAverages,

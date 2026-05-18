@@ -128,6 +128,11 @@ export function RadarView() {
     const abortController = new AbortController()
     abortRef.current = abortController
 
+    // 45-second timeout for the API call
+    const timeoutId = setTimeout(() => {
+      abortController.abort()
+    }, 45_000)
+
     try {
       const res = await fetch('/api/radar/search', {
         method: 'POST',
@@ -141,12 +146,19 @@ export function RadarView() {
       })
 
       if (!res.ok) {
-        const errorData = await res.json().catch(() => ({}))
-        throw new Error(errorData.error || 'Erro na busca')
+        let errorMsg = 'Erro na busca'
+        try {
+          const errorData = await res.json().catch(() => ({}))
+          errorMsg = errorData.error || errorData.details || errorData.message || `Erro ${res.status}: ${res.statusText}`
+        } catch { /* use default */ }
+        throw new Error(errorMsg)
       }
 
-      completeAll()
       const data = await res.json()
+
+      // Complete loading progress ONLY on success
+      clearTimeout(timeoutId)
+      completeAll()
 
       if (data.entries && data.entries.length > 0) {
         toast.success(`${data.entries.length} entrada(s) encontrada(s)!`)
@@ -157,10 +169,14 @@ export function RadarView() {
 
       setQuery('')
     } catch (err) {
+      clearTimeout(timeoutId)
+      // Stop the estimated progress on error
+      cancelProgress()
       if (err instanceof Error && err.name === 'AbortError') {
         toast.info('Busca cancelada')
       } else {
-        toast.error(err instanceof Error ? err.message : 'Erro na busca')
+        const msg = err instanceof Error ? err.message : 'Erro na busca'
+        toast.error(msg)
       }
     } finally {
       setIsLoading(false)

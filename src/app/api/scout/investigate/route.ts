@@ -105,10 +105,11 @@ const FORBIDDEN_PHRASES = [
 ];
 
 // ============================================================
-// SSE Event Helper
+// SSE Event Helper — includes runId for traceability
 // ============================================================
-function sseEvent(event: string, data: Record<string, unknown>): string {
-  return `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+function sseEvent(event: string, data: Record<string, unknown>, runId?: string): string {
+  const payload = runId ? { ...data, runId } : data;
+  return `event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`;
 }
 
 // ============================================================
@@ -440,20 +441,48 @@ export async function POST(request: NextRequest) {
       data: { companyName: trimmedName, cnpj: cnpj?.trim() || null, status: 'investigating' },
     });
 
+    const runId = investigation.id;
+
     // SSE stream
     const encoder = new TextEncoder();
     let closed = false;
+    let lastEventTime = Date.now();
+    let heartbeatInterval: NodeJS.Timeout | null = null;
 
     const stream = new ReadableStream({
       async start(controller) {
         const send = (event: string, data: Record<string, unknown>) => {
           if (closed) return;
           try {
-            controller.enqueue(encoder.encode(sseEvent(event, { ...data, timestamp: new Date().toISOString() })));
-          } catch {
+            lastEventTime = Date.now();
+            controller.enqueue(encoder.encode(sseEvent(event, { ...data, timestamp: new Date().toISOString() }, runId)));
+          } catch (enqueueError) {
+            console.error('[Scout SSE] Failed to enqueue event:', { runId, event, error: String(enqueueError) });
             closed = true;
           }
         };
+
+        // Heartbeat: send warning if >10s between events
+        heartbeatInterval = setInterval(() => {
+          if (closed) {
+            if (heartbeatInterval) clearInterval(heartbeatInterval);
+            return;
+          }
+          const elapsed = Date.now() - lastEventTime;
+          if (elapsed > 10000) {
+            try {
+              controller.enqueue(encoder.encode(sseEvent('warning', {
+                message: 'Pipeline em andamento — aguardando resposta do provedor...',
+                elapsedMs: elapsed,
+                timestamp: new Date().toISOString(),
+              }, runId)));
+              lastEventTime = Date.now();
+            } catch {
+              closed = true;
+              if (heartbeatInterval) clearInterval(heartbeatInterval);
+            }
+          }
+        }, 10000);
 
         const sendStageStart = (stageId: string) => {
           const stage = PIPELINE_STAGES.find(s => s.id === stageId);
@@ -469,58 +498,93 @@ export async function POST(request: NextRequest) {
           send('progress_stage_warning', { stageId, message });
         };
 
-        const markInvestigationFailed = async (reason: string) => {
+        const markInvestigationFailed = async (reason: string, stage?: string) => {
           // CRITICAL: Mark as FAILED, never as completed
+          console.error('[Scout SSE] Marking investigation as failed:', { runId, stage: stage || 'unknown', reason });
           try {
             await db.scoutInvestigation.update({
               where: { id: investigation.id },
               data: {
                 status: 'failed',
-                rawData: JSON.stringify({ error: reason, failedAt: new Date().toISOString() }),
+                rawData: JSON.stringify({ error: reason, failedAt: new Date().toISOString(), stage: stage || 'unknown' }),
               },
             });
           } catch (dbError) {
-            console.error('[Scout] Failed to mark investigation as failed:', dbError);
+            console.error('[Scout SSE] Failed to mark investigation as failed in DB:', { runId, error: String(dbError) });
           }
         };
 
         try {
-          const zai = await ZAI.create();
+          // ====== EMIT RUN STARTED ======
+          send('run_started', { runId, companyName: trimmedName });
+
+          // ====== ZAI INIT (with its own try-catch so stream doesn't hang) ======
+          let zai: Awaited<ReturnType<typeof ZAI.create>>;
+          try {
+            zai = await ZAI.create();
+          } catch (zaiError) {
+            console.error('[Scout SSE] ZAI.create() failed:', { runId, error: zaiError instanceof Error ? zaiError.message : String(zaiError) });
+            await markInvestigationFailed('Falha ao inicializar o serviço de IA.', 'zai_init');
+            send('progress_stage_failed', { stageId: 'preparing', message: 'Falha ao inicializar o serviço de IA.' });
+            send('final_response_ready', {
+              metadata: {
+                error: true,
+                message: 'Não foi possível inicializar o serviço de IA. Tente novamente em alguns instantes.',
+                investigationId: runId,
+              },
+            });
+            return; // EXIT — cannot continue without ZAI
+          }
 
           // ====== STAGE 1: PREPARING ======
           sendStageStart('preparing');
           send('evidence_found', { message: `Empresa identificada: ${trimmedName}${cnpj ? `, CNPJ: ${cnpj}` : ''}`, confidence: 0.9 });
           sendStageComplete('preparing');
 
-          // ====== STAGE 2: CADASTRE (Real BrasilAPI + Web Search) ======
+          // ====== STAGE 2: CADASTRE (Real BrasilApi + Web Search) ======
           sendStageStart('cadastre');
 
           // Execute the research engine — this does real BrasilAPI + web search with retry
-          const researchResult = await executeResearch(
-            trimmedName,
-            cnpj?.trim() || undefined,
-            undefined,
-            (event, data) => send(event, data),
-          );
+          let researchResult;
+          try {
+            researchResult = await executeResearch(
+              trimmedName,
+              cnpj?.trim() || undefined,
+              undefined,
+              (event, data) => send(event, data),
+            );
+          } catch (researchError) {
+            console.error('[Scout SSE] executeResearch threw:', { runId, stage: 'cadastre', error: researchError instanceof Error ? researchError.message : String(researchError) });
+            await markInvestigationFailed('Erro ao consultar fontes de pesquisa.', 'cadastre');
+            send('progress_stage_failed', { stageId: 'cadastre', message: 'Erro ao consultar fontes de pesquisa.' });
+            send('final_response_ready', {
+              metadata: {
+                error: true,
+                message: 'Não consegui consultar as fontes de pesquisa. Tente novamente.',
+                investigationId: runId,
+              },
+            });
+            return; // EXIT
+          }
 
           // If research itself failed (no results at all), this is a CRITICAL failure
           if (researchResult.status === 'failed') {
             send('progress_stage_failed', { stageId: 'cadastre', message: researchResult.error?.message || 'Pesquisa falhou' });
-            await markInvestigationFailed(researchResult.error?.message || 'Pesquisa falhou');
+            await markInvestigationFailed(researchResult.error?.message || 'Pesquisa falhou', 'cadastre');
             send('final_response_ready', {
               metadata: {
                 error: true,
                 message: researchResult.error?.message || 'Não consegui encontrar fontes confiáveis.',
-                investigationId: investigation.id,
+                investigationId: runId,
               },
             });
             return; // EXIT — do not continue pipeline
           }
 
           if (researchResult.status === 'cancelled') {
-            await markInvestigationFailed('Investigação cancelada pelo usuário');
+            await markInvestigationFailed('Investigação cancelada pelo usuário', 'cadastre');
             send('final_response_ready', {
-              metadata: { error: true, message: 'Investigação cancelada.', investigationId: investigation.id },
+              metadata: { error: true, message: 'Investigação cancelada.', investigationId: runId },
             });
             return;
           }
@@ -531,12 +595,12 @@ export async function POST(request: NextRequest) {
 
           if (searchResults.length === 0) {
             send('progress_stage_failed', { stageId: 'cadastre', message: 'Nenhum resultado encontrado em nenhuma fonte' });
-            await markInvestigationFailed('Nenhum resultado encontrado em nenhuma fonte. Tente informar o CNPJ, site oficial ou um termo mais específico.');
+            await markInvestigationFailed('Nenhum resultado encontrado em nenhuma fonte. Tente informar o CNPJ, site oficial ou um termo mais específico.', 'cadastre');
             send('final_response_ready', {
               metadata: {
                 error: true,
                 message: 'Não consegui obter fontes confiáveis suficientes. Tente informar o CNPJ, site oficial ou um nome mais específico.',
-                investigationId: investigation.id,
+                investigationId: runId,
               },
             });
             return; // EXIT — do not continue pipeline
@@ -547,7 +611,18 @@ export async function POST(request: NextRequest) {
 
           // ====== STAGE 3: SECTOR DETECTION ======
           sendStageStart('sector_detection');
-          const classification = await classifyCompany(zai, trimmedName, searchResults, cnpjData, send);
+          let classification;
+          try {
+            classification = await classifyCompany(zai, trimmedName, searchResults, cnpjData, send);
+          } catch (classificationError) {
+            console.error('[Scout SSE] classifyCompany failed:', { runId, stage: 'sector_detection', error: classificationError instanceof Error ? classificationError.message : String(classificationError) });
+            await markInvestigationFailed('Erro ao classificar o setor da empresa.', 'sector_detection');
+            send('progress_stage_failed', { stageId: 'sector_detection', message: 'Erro ao classificar o setor.' });
+            send('final_response_ready', {
+              metadata: { error: true, message: 'Não consegui classificar o setor da empresa. Tente novamente.', investigationId: runId },
+            });
+            return;
+          }
           send('evidence_found', { message: `Setor: ${classification.sector}, Subtipo: ${classification.subSector}, Porte: ${classification.scale}`, confidence: classification.scale === 'indefinido_sem_evidencia' ? 0.3 : 0.8 });
           sendStageComplete('sector_detection');
 
@@ -561,7 +636,18 @@ export async function POST(request: NextRequest) {
 
           // ====== STAGE 5: EVIDENCE EXTRACTION ======
           sendStageStart('evidence');
-          const evidenceList = await extractEvidence(zai, trimmedName, searchResults, classification, send);
+          let evidenceList;
+          try {
+            evidenceList = await extractEvidence(zai, trimmedName, searchResults, classification, send);
+          } catch (evidenceError) {
+            console.error('[Scout SSE] extractEvidence failed:', { runId, stage: 'evidence', error: evidenceError instanceof Error ? evidenceError.message : String(evidenceError) });
+            await markInvestigationFailed('Erro ao extrair evidências.', 'evidence');
+            send('progress_stage_failed', { stageId: 'evidence', message: 'Erro ao extrair evidências.' });
+            send('final_response_ready', {
+              metadata: { error: true, message: 'Não consegui extrair evidências. Tente novamente.', investigationId: runId },
+            });
+            return;
+          }
           const facts = evidenceList.filter(e => e.type === 'fact');
           const gaps = evidenceList.filter(e => e.type === 'gap');
           send('confidence_updated', { confidence: facts.length > 5 ? 0.7 : facts.length > 2 ? 0.5 : 0.3 });
@@ -571,12 +657,12 @@ export async function POST(request: NextRequest) {
           const evidenceGate = evaluateEvidence(evidenceList);
           if (evidenceGate.recommendation === 'no_evidence') {
             send('progress_stage_failed', { stageId: 'evidence', message: evidenceGate.message });
-            await markInvestigationFailed(evidenceGate.message);
+            await markInvestigationFailed(evidenceGate.message, 'evidence');
             send('final_response_ready', {
               metadata: {
                 error: true,
                 message: evidenceGate.message,
-                investigationId: investigation.id,
+                investigationId: runId,
               },
             });
             return; // EXIT — no facts, no analysis
@@ -587,16 +673,28 @@ export async function POST(request: NextRequest) {
             // Continue but the summary will reflect this
           }
 
-          // ====== STAGE 6: COMPETITION (Real search) ======
+          // ====== STAGE 6: COMPETITION (Real search — non-fatal on error) ======
           sendStageStart('competition');
-          const competitionResults = await searchCompetition(zai, trimmedName, classification.sector, send);
+          let competitionResults: SearchResult[] = [];
+          try {
+            competitionResults = await searchCompetition(zai, trimmedName, classification.sector, send);
+          } catch (competitionError) {
+            console.error('[Scout SSE] searchCompetition failed:', { runId, stage: 'competition', error: competitionError instanceof Error ? competitionError.message : String(competitionError) });
+            sendStageWarning('competition', 'Busca competitiva falhou, continuando sem dados de concorrência.');
+          }
           // Merge competition results into search results for PORTA scoring
           const allSearchResults = [...searchResults, ...competitionResults];
           sendStageComplete('competition');
 
-          // ====== STAGE 7: PORTA SCORE ======
+          // ====== STAGE 7: PORTA SCORE (non-fatal on error) ======
           sendStageStart('porta');
-          const portaResult = await generatePortaScore(zai, trimmedName, classification, evidenceList, allSearchResults, send);
+          let portaResult = null;
+          try {
+            portaResult = await generatePortaScore(zai, trimmedName, classification, evidenceList, allSearchResults, send);
+          } catch (portaError) {
+            console.error('[Scout SSE] generatePortaScore failed:', { runId, stage: 'porta', error: portaError instanceof Error ? portaError.message : String(portaError) });
+            sendStageWarning('porta', 'Erro ao calcular score PORTA, continuando sem score.');
+          }
 
           if (portaResult) {
             send('evidence_found', { message: `Score PORTA: ${portaResult.total.toFixed(1)}/10`, confidence: portaResult.total > 5 ? 0.7 : 0.4 });
@@ -605,18 +703,36 @@ export async function POST(request: NextRequest) {
           }
           sendStageComplete('porta');
 
-          // ====== STAGE 8: THESIS ======
+          // ====== STAGE 8: THESIS (non-fatal on individual errors) ======
           sendStageStart('thesis');
-          let summary = await generateSummary(zai, trimmedName, classification, evidenceList);
-          const commercialThesis = await generateCommercialThesis(zai, trimmedName, classification, evidenceList, classification.subSector || 'mista');
+          let summary = '';
+          let commercialThesis: Record<string, unknown> = {};
+          try {
+            summary = await generateSummary(zai, trimmedName, classification, evidenceList);
+          } catch (summaryError) {
+            console.error('[Scout SSE] generateSummary failed:', { runId, stage: 'thesis', error: summaryError instanceof Error ? summaryError.message : String(summaryError) });
+            summary = 'Resumo não disponível — erro ao gerar.';
+          }
+          try {
+            commercialThesis = await generateCommercialThesis(zai, trimmedName, classification, evidenceList, classification.subSector || 'mista');
+          } catch (thesisError) {
+            console.error('[Scout SSE] generateCommercialThesis failed:', { runId, stage: 'thesis', error: thesisError instanceof Error ? thesisError.message : String(thesisError) });
+            commercialThesis = { thesis: 'Tese não disponível por erro na geração.' };
+          }
           sendStageComplete('thesis');
 
-          // ====== STAGE 9: QUALITY VALIDATION ======
+          // ====== STAGE 9: QUALITY VALIDATION (non-fatal) ======
           sendStageStart('validating');
-          const qc = await qualityCheck(zai, summary, evidenceList, classification);
-          if (!qc.passed && qc.rewrittenSummary) {
-            summary = qc.rewrittenSummary;
-            sendStageWarning('validating', `Verificação de qualidade: reescrita aplicada (${qc.issues.length} problemas)`);
+          let qc: { passed: boolean; issues: string[]; rewrittenSummary?: string } = { passed: true, issues: [] };
+          try {
+            qc = await qualityCheck(zai, summary, evidenceList, classification);
+            if (!qc.passed && qc.rewrittenSummary) {
+              summary = qc.rewrittenSummary;
+              sendStageWarning('validating', `Verificação de qualidade: reescrita aplicada (${qc.issues.length} problemas)`);
+            }
+          } catch (qcError) {
+            console.error('[Scout SSE] qualityCheck failed:', { runId, stage: 'validating', error: qcError instanceof Error ? qcError.message : String(qcError) });
+            sendStageWarning('validating', 'Verificação de qualidade falhou, usando resultado sem verificação.');
           }
           sendStageComplete('validating');
 
@@ -624,35 +740,45 @@ export async function POST(request: NextRequest) {
           sendStageStart('saving');
 
           // CRITICAL: Only save as "completed" if we reached this point
-          // (meaning all critical stages succeeded and evidence gate passed)
-          const updatedInvestigation = await db.scoutInvestigation.update({
-            where: { id: investigation.id },
-            data: {
-              status: 'completed', // ONLY set to completed here, after all validation
-              summary,
-              sector: classification.sector || null,
-              subSector: classification.subSector || null,
-              rawData: JSON.stringify({
-                searches: allSearchResults.length,
-                results: allSearchResults.slice(0, 30),
-                cnpjData: cnpjData || null,
-                searchedAt: new Date().toISOString(),
-                evidenceGate: {
-                  hasMinimumEvidence: evidenceGate.hasMinimumEvidence,
-                  factCount: evidenceGate.factCount,
-                  highConfidenceFactCount: evidenceGate.highConfidenceFactCount,
-                  recommendation: evidenceGate.recommendation,
-                },
-              }),
-              evidences: JSON.stringify(evidenceList),
-              classification: JSON.stringify(classification),
-              commercialThesis: JSON.stringify(commercialThesis),
-              sources: JSON.stringify(allSearchResults.slice(0, 20).map((r) => ({
-                title: r.title, url: r.url, snippet: r.snippet, type: 'web_search', query: r.query,
-              }))),
-              qualityCheck: JSON.stringify(qc),
-            },
-          });
+          let updatedInvestigation;
+          try {
+            updatedInvestigation = await db.scoutInvestigation.update({
+              where: { id: investigation.id },
+              data: {
+                status: 'completed', // ONLY set to completed here, after all validation
+                summary,
+                sector: classification.sector || null,
+                subSector: classification.subSector || null,
+                rawData: JSON.stringify({
+                  searches: allSearchResults.length,
+                  results: allSearchResults.slice(0, 30),
+                  cnpjData: cnpjData || null,
+                  searchedAt: new Date().toISOString(),
+                  evidenceGate: {
+                    hasMinimumEvidence: evidenceGate.hasMinimumEvidence,
+                    factCount: evidenceGate.factCount,
+                    highConfidenceFactCount: evidenceGate.highConfidenceFactCount,
+                    recommendation: evidenceGate.recommendation,
+                  },
+                }),
+                evidences: JSON.stringify(evidenceList),
+                classification: JSON.stringify(classification),
+                commercialThesis: JSON.stringify(commercialThesis),
+                sources: JSON.stringify(allSearchResults.slice(0, 20).map((r) => ({
+                  title: r.title, url: r.url, snippet: r.snippet, type: 'web_search', query: r.query,
+                }))),
+                qualityCheck: JSON.stringify(qc),
+              },
+            });
+          } catch (dbSaveError) {
+            console.error('[Scout SSE] Failed to save investigation:', { runId, stage: 'saving', error: dbSaveError instanceof Error ? dbSaveError.message : String(dbSaveError) });
+            await markInvestigationFailed('Erro ao salvar investigação no banco de dados.', 'saving');
+            send('progress_stage_failed', { stageId: 'saving', message: 'Erro ao salvar.' });
+            send('final_response_ready', {
+              metadata: { error: true, message: 'Erro ao salvar a investigação. Tente novamente.', investigationId: runId },
+            });
+            return;
+          }
 
           // Only create PORTA score if it was actually calculated with evidence
           let portaScore: { id: string; investigationId: string; porte: number; operacao: number; retorno: number; tecnologia: number; adocao: number; total: number; sector: string | null; subSector: string | null; notes: string | null; createdAt: Date; updatedAt: Date } | null = null;
@@ -684,21 +810,30 @@ export async function POST(request: NextRequest) {
           });
 
         } catch (analysisError) {
-          console.error('[Scout SSE] Pipeline error:', analysisError);
-
-          // CRITICAL: Mark as FAILED
-          const errorMsg = analysisError instanceof Error ? analysisError.message : 'Erro desconhecido';
-          send('progress_stage_failed', { stageId: 'pipeline', message: errorMsg });
-          await markInvestigationFailed(errorMsg);
-
-          send('final_response_ready', {
-            metadata: {
-              error: true,
-              message: `Investigação falhou: ${errorMsg}`,
-              investigationId: investigation.id,
-            },
+          console.error('[Scout SSE] Unhandled pipeline error:', {
+            runId,
+            error: analysisError instanceof Error ? analysisError.message : String(analysisError),
+            stack: analysisError instanceof Error ? analysisError.stack : undefined,
           });
+
+          // CRITICAL: Mark as FAILED and send final error — wrap sends in try/catch since stream may be broken
+          const errorMsg = analysisError instanceof Error ? analysisError.message : 'Erro desconhecido';
+          try {
+            send('progress_stage_failed', { stageId: 'pipeline', message: errorMsg });
+          } catch { /* stream may already be broken */ }
+          await markInvestigationFailed(errorMsg, 'pipeline_unhandled');
+          try {
+            send('final_response_ready', {
+              metadata: {
+                error: true,
+                message: `Investigação falhou: ${errorMsg}`,
+                investigationId: runId,
+              },
+            });
+          } catch { /* stream may already be broken */ }
         } finally {
+          // ALWAYS: stop heartbeat and close controller
+          if (heartbeatInterval) clearInterval(heartbeatInterval);
           try { controller.close(); } catch { /* already closed */ }
           closed = true;
         }
@@ -713,7 +848,7 @@ export async function POST(request: NextRequest) {
       },
     });
   } catch (error) {
-    console.error('[Scout] Error:', error);
+    console.error('[Scout] Outer error:', { error: error instanceof Error ? error.message : String(error) });
     return new Response(JSON.stringify({ error: 'Internal server error' }), { status: 500, headers: { 'Content-Type': 'application/json' } });
   }
 }

@@ -1,6 +1,12 @@
 'use client'
 
 import { useState, useEffect, useCallback, useRef } from 'react'
+
+// Unique ID counter for SSE ticker items (avoids Date.now() collisions)
+let _sseEventCounter = 0
+function nextSSEId(prefix: string): string {
+  return `${prefix}-${++_sseEventCounter}`
+}
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
@@ -160,6 +166,8 @@ const CONFIDENCE_COLORS: Record<string, string> = {
 
 // ---------- SSE Hook ----------
 
+const SSE_STREAM_TIMEOUT_MS = 30_000 // 30 seconds — no data timeout
+
 function useSSEInvestigation(onInvestigationFailed?: () => void) {
   const [stageStatuses, setStageStatuses] = useState<Record<string, StageStatus>>({})
   const [currentStageId, setCurrentStageId] = useState<string | null>(null)
@@ -173,6 +181,28 @@ function useSSEInvestigation(onInvestigationFailed?: () => void) {
   const [error, setError] = useState<ErrorState | null>(null)
   const abortRef = useRef<AbortController | null>(null)
   const timerRef = useRef<NodeJS.Timeout | null>(null)
+  const streamTimeoutRef = useRef<NodeJS.Timeout | null>(null)
+  const receivedFinalResponseRef = useRef(false)
+  const errorDetectedRef = useRef(false)
+
+  const resetStreamTimeout = (abortController: AbortController) => {
+    if (streamTimeoutRef.current) clearTimeout(streamTimeoutRef.current)
+    streamTimeoutRef.current = setTimeout(() => {
+      // No data received for 30 seconds — abort
+      console.warn('[SSE] Stream timeout — no data received for 30s')
+      abortController.abort()
+      setError({ type: 'timeout', message: 'A investigação demorou demais para responder. Tente novamente.' })
+      setIsLoading(false)
+      if (timerRef.current) clearInterval(timerRef.current)
+    }, SSE_STREAM_TIMEOUT_MS)
+  }
+
+  const clearStreamTimeout = () => {
+    if (streamTimeoutRef.current) {
+      clearTimeout(streamTimeoutRef.current)
+      streamTimeoutRef.current = null
+    }
+  }
 
   const startInvestigation = async (companyName: string, cnpj?: string) => {
     setStageStatuses({})
@@ -185,6 +215,8 @@ function useSSEInvestigation(onInvestigationFailed?: () => void) {
     setResult(null)
     setError(null)
     setIsLoading(true)
+    receivedFinalResponseRef.current = false
+    errorDetectedRef.current = false
 
     timerRef.current = setInterval(() => {
       setElapsedSeconds(prev => prev + 1)
@@ -194,12 +226,24 @@ function useSSEInvestigation(onInvestigationFailed?: () => void) {
     abortRef.current = abortController
 
     try {
-      const response = await fetch('/api/scout/investigate', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ companyName, cnpj: cnpj || undefined }),
-        signal: abortController.signal,
-      })
+      let response: Response
+      try {
+        response = await fetch('/api/scout/investigate', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ companyName, cnpj: cnpj || undefined }),
+          signal: abortController.signal,
+        })
+      } catch (fetchError) {
+        // Fetch failed entirely — no response at all
+        if (fetchError instanceof Error && fetchError.name === 'AbortError') {
+          throw fetchError // let the catch below handle it
+        }
+        setError({ type: 'no_internet', message: 'Não foi possível conectar ao servidor. Verifique sua conexão.' })
+        setIsLoading(false)
+        if (timerRef.current) clearInterval(timerRef.current)
+        return
+      }
 
       if (!response.ok) {
         let errorMsg = 'Erro na investigação'
@@ -207,20 +251,32 @@ function useSSEInvestigation(onInvestigationFailed?: () => void) {
           const errorData = await response.json().catch(() => ({}))
           errorMsg = errorData.error || errorData.details || `Erro ${response.status}: ${response.statusText}`
         } catch { /* use default error */ }
-        throw new Error(errorMsg)
+        setError({ type: 'api_down', message: errorMsg })
+        setIsLoading(false)
+        if (timerRef.current) clearInterval(timerRef.current)
+        return
       }
 
       const contentType = response.headers.get('content-type') || ''
       if (contentType.includes('text/event-stream')) {
         const reader = response.body?.getReader()
-        if (!reader) throw new Error('No response body')
+        if (!reader) {
+          setError({ type: 'api_down', message: 'Resposta inesperada do servidor.' })
+          setIsLoading(false)
+          if (timerRef.current) clearInterval(timerRef.current)
+          return
+        }
 
         const decoder = new TextDecoder()
         let buffer = ''
+        resetStreamTimeout(abortController)
 
         while (true) {
           const { done, value } = await reader.read()
           if (done) break
+
+          // Reset stream timeout on each data received
+          resetStreamTimeout(abortController)
 
           buffer += decoder.decode(value, { stream: true })
           const parts = buffer.split('\n\n')
@@ -238,24 +294,29 @@ function useSSEInvestigation(onInvestigationFailed?: () => void) {
             try {
               const event = JSON.parse(dataStr)
               handleEvent(eventType, event)
-            } catch { /* skip */ }
+            } catch { /* skip malformed JSON */ }
           }
         }
-      } else {
-        const data = await response.json()
-        if (data.error) {
-          setError({ type: 'unknown', message: data.error || data.details || 'Erro na investigação' })
-        } else {
-          setResult(data)
+
+        // Stream ended — check if we received final_response_ready
+        clearStreamTimeout()
+        if (!receivedFinalResponseRef.current && !errorDetectedRef.current) {
+          // Stream ended without final_response_ready
+          setError({ type: 'api_down', message: 'A investigação foi interrompida antes de concluir. Tente novamente.' })
+          setIsLoading(false)
+          if (timerRef.current) clearInterval(timerRef.current)
+          onInvestigationFailed?.()
         }
+      } else {
+        // Response is NOT SSE — unexpected
+        setError({ type: 'api_down', message: 'Resposta inesperada do servidor.' })
         setIsLoading(false)
         if (timerRef.current) clearInterval(timerRef.current)
       }
     } catch (err) {
+      clearStreamTimeout()
       if (err instanceof Error && err.name === 'AbortError') {
-        setError({ type: 'cancelled', message: 'Investigação cancelada pelo usuário.' })
-      } else if (err instanceof TypeError && err.message.includes('fetch')) {
-        setError({ type: 'no_internet', message: 'Sem conexão com o servidor. Verifique sua internet e tente novamente.' })
+        setError({ type: 'cancelled', message: 'Investigação cancelada.' })
       } else {
         const msg = err instanceof Error ? err.message : 'Erro na investigação'
         const errorType = msg.toLowerCase().includes('timeout') ? 'timeout' as const
@@ -270,12 +331,27 @@ function useSSEInvestigation(onInvestigationFailed?: () => void) {
 
   const handleEvent = (eventType: string, event: Record<string, unknown>) => {
     switch (eventType) {
+      case 'run_started':
+        // Log for traceability — runId available in event.runId
+        console.info('[SSE] Run started:', event.runId, event.companyName)
+        break
+      case 'warning':
+        // Heartbeat warning from server — just add to ticker
+        if (event.message) {
+          setTickerItems(prev => [...prev, {
+            id: nextSSEId('warn'),
+            message: event.message as string,
+            type: 'warning' as const,
+            timestamp: Date.now(),
+          }])
+        }
+        break
       case 'progress_stage_started':
         setStageStatuses(prev => ({ ...prev, [event.stageId as string]: 'active' }))
         setCurrentStageId(event.stageId as string || null)
         if (event.message) {
           setTickerItems(prev => [...prev, {
-            id: `t-${event.stageId}-${Date.now()}`,
+            id: nextSSEId(`t-${event.stageId}`),
             message: event.message as string,
             type: 'info',
             timestamp: Date.now(),
@@ -285,7 +361,7 @@ function useSSEInvestigation(onInvestigationFailed?: () => void) {
       case 'progress_stage_completed':
         setStageStatuses(prev => ({ ...prev, [event.stageId as string]: 'completed' }))
         setTickerItems(prev => [...prev, {
-          id: `t-${event.stageId}-done-${Date.now()}`,
+          id: nextSSEId(`t-${event.stageId}-done`),
           message: `${event.label || event.stageId} ✓`,
           type: 'found',
           timestamp: Date.now(),
@@ -295,7 +371,7 @@ function useSSEInvestigation(onInvestigationFailed?: () => void) {
         setStageStatuses(prev => ({ ...prev, [event.stageId as string]: 'warning' }))
         if (event.message) {
           setTickerItems(prev => [...prev, {
-            id: `t-${event.stageId}-warn-${Date.now()}`,
+            id: nextSSEId(`t-${event.stageId}-warn`),
             message: event.message as string,
             type: 'warning',
             timestamp: Date.now(),
@@ -305,6 +381,7 @@ function useSSEInvestigation(onInvestigationFailed?: () => void) {
       case 'progress_stage_failed':
         setStageStatuses(prev => ({ ...prev, [event.stageId as string]: 'failed' }))
         // Don't complete remaining stages on failure
+        errorDetectedRef.current = true
         setIsLoading(false)
         if (timerRef.current) clearInterval(timerRef.current)
         setError({ type: 'api_down', message: (event.message as string) || 'Uma etapa falhou.' })
@@ -313,7 +390,7 @@ function useSSEInvestigation(onInvestigationFailed?: () => void) {
         break
       case 'evidence_found':
         setTickerItems(prev => [...prev, {
-          id: `ev-${Date.now()}-${Math.random()}`,
+          id: nextSSEId('ev'),
           message: (event.message as string) || 'Evidência encontrada',
           type: 'found',
           timestamp: Date.now(),
@@ -343,6 +420,7 @@ function useSSEInvestigation(onInvestigationFailed?: () => void) {
         }
         break
       case 'final_response_ready':
+        receivedFinalResponseRef.current = true
         if (event.metadata && !(event.metadata as Record<string, unknown>).error) {
           setResult(event.metadata as Record<string, unknown>)
           // Only complete remaining stages on SUCCESS
@@ -357,6 +435,7 @@ function useSSEInvestigation(onInvestigationFailed?: () => void) {
           })
         } else if ((event.metadata as Record<string, unknown>)?.error) {
           // On failure: do NOT complete stages, set error state
+          errorDetectedRef.current = true
           const errorMsg = ((event.metadata as Record<string, unknown>).message as string) || 'Erro na investigação'
           setError({ type: 'api_down', message: errorMsg })
           // Mark all pending stages as failed, not completed
@@ -380,6 +459,7 @@ function useSSEInvestigation(onInvestigationFailed?: () => void) {
 
   const cancel = () => {
     setIsCancelling(true)
+    clearStreamTimeout()
     if (abortRef.current) abortRef.current.abort()
     if (timerRef.current) clearInterval(timerRef.current)
     setIsLoading(false)
@@ -467,7 +547,7 @@ export function ScoutView() {
   }
 
   const addToCrm = async () => {
-    if (!selectedInvestigation) return
+    if (!selectedInvestigation || selectedInvestigation.status !== 'completed' || !selectedInvestigation.portaScore) return
     try {
       const res = await fetch('/api/crm/accounts', {
         method: 'POST',
@@ -635,7 +715,7 @@ export function ScoutView() {
                           {SUB_SECTOR_LABELS[selectedInvestigation.subSector] || selectedInvestigation.subSector}
                         </Badge>
                       )}
-                      {selectedInvestigation.status === 'completed' && (
+                      {selectedInvestigation.status === 'completed' && selectedInvestigation.portaScore && (
                         <Button variant="outline" size="sm" className="text-xs h-7" onClick={addToCrm}>
                           <Users className="h-3 w-3 mr-1" />
                           Add to CRM
@@ -676,8 +756,32 @@ export function ScoutView() {
                 </CardContent>
               </Card>
 
-              {/* PORTA Score */}
-              {selectedInvestigation.portaScore && (
+              {/* Failed investigation retry banner */}
+              {selectedInvestigation.status === 'failed' && (
+                <Card className="border-rose-200 dark:border-rose-800 bg-rose-50 dark:bg-rose-950/20">
+                  <CardContent className="p-4 flex items-center justify-between">
+                    <div>
+                      <p className="text-sm font-medium text-rose-700 dark:text-rose-400">Investigação falhou</p>
+                      <p className="text-xs text-rose-600 dark:text-rose-500 mt-0.5">Não foi possível coletar evidências suficientes para esta empresa.</p>
+                    </div>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      className="text-xs border-rose-300 dark:border-rose-700 hover:bg-rose-100 dark:hover:bg-rose-900/30"
+                      onClick={() => {
+                        setCompanyName(selectedInvestigation.companyName)
+                        setCnpj(selectedInvestigation.cnpj || '')
+                        setSelectedInvestigation(null)
+                      }}
+                    >
+                      <RefreshCw className="h-3 w-3 mr-1" />Tentar novamente
+                    </Button>
+                  </CardContent>
+                </Card>
+              )}
+
+              {/* PORTA Score — only shown for completed investigations with a score */}
+              {selectedInvestigation.status === 'completed' && selectedInvestigation.portaScore && (
                 <PortaScoreDisplay score={selectedInvestigation.portaScore} />
               )}
 

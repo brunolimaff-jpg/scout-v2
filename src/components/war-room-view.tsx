@@ -1,6 +1,12 @@
 'use client'
 
 import { useState, useEffect, useRef, useCallback } from 'react'
+
+// Unique ID counter for message IDs (avoids Date.now() collisions)
+let _warRoomMsgCounter = 0
+function nextMsgId(prefix: string): string {
+  return `${prefix}-${++_warRoomMsgCounter}`
+}
 import { Button } from '@/components/ui/button'
 import { Textarea } from '@/components/ui/textarea'
 import { Badge } from '@/components/ui/badge'
@@ -218,7 +224,7 @@ export function WarRoomView() {
     setIsLoading(true)
 
     const tempUserMsg: WarRoomMessage = {
-      id: `temp-user-${Date.now()}`,
+      id: nextMsgId('temp-user'),
       role: 'user',
       content: text,
       sources: [],
@@ -229,6 +235,11 @@ export function WarRoomView() {
     const abortController = new AbortController()
     abortRef.current = abortController
 
+    // 45-second timeout for the API call
+    const timeoutId = setTimeout(() => {
+      abortController.abort()
+    }, 45_000)
+
     try {
       const res = await fetch('/api/warroom/chat', {
         method: 'POST',
@@ -237,11 +248,19 @@ export function WarRoomView() {
         signal: abortController.signal,
       })
 
-      if (!res.ok) throw new Error('Failed to send message')
+      if (!res.ok) {
+        let errorMsg = 'Erro ao consultar'
+        try {
+          const errorData = await res.json().catch(() => ({}))
+          errorMsg = errorData.error || errorData.details || errorData.message || `Erro ${res.status}: ${res.statusText}`
+        } catch { /* use default */ }
+        throw new Error(errorMsg)
+      }
 
       const data = await res.json()
 
-      // Complete loading progress
+      // Complete loading progress ONLY on success
+      clearTimeout(timeoutId)
       completeAll()
 
       if (!currentSessionId && data.sessionId) {
@@ -250,7 +269,7 @@ export function WarRoomView() {
       }
 
       const assistantMsg: WarRoomMessage = {
-        id: data.assistantMessageId || `temp-asst-${Date.now()}`,
+        id: data.assistantMessageId || nextMsgId('temp-asst'),
         role: 'assistant',
         content: data.answer,
         intent: data.intent,
@@ -267,10 +286,14 @@ export function WarRoomView() {
         assistantMsg,
       ])
     } catch (err) {
+      clearTimeout(timeoutId)
+      // Stop the estimated progress on error
+      cancelProgress()
       if (err instanceof Error && err.name === 'AbortError') {
         toast.info('Consulta cancelada')
       } else {
-        toast.error('Erro ao consultar. Tente novamente.')
+        const msg = err instanceof Error ? err.message : 'Erro ao consultar. Tente novamente.'
+        toast.error(msg)
       }
       setMessages(prev => prev.filter(m => m.id !== tempUserMsg.id))
     } finally {
