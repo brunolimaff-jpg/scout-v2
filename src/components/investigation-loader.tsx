@@ -75,8 +75,8 @@ export interface InvestigationLoaderProps {
 
 export interface ErrorState {
   type: 'no_internet' | 'api_slow' | 'api_down' | 'cnpj_not_found' | 'company_ambiguous' |
-        'sector_uncertain' | 'docs_not_found' | 'no_reliable_source' | 'partial_result' |
-        'timeout' | 'cancelled' | 'session_recovered' | 'cache_used' | 'unknown'
+        'sector_uncertain' | 'docs_not_found' | 'no_reliable_source' |
+        'timeout' | 'cancelled' | 'insufficient_evidence' | 'unknown'
   message: string
   action?: { label: string; handler: () => void }
 }
@@ -86,17 +86,17 @@ export interface ErrorState {
 // ============================================================
 
 export const SCOUT_STAGES: StageDef[] = [
-  { id: 'preparing', label: 'Preparando investigação', description: 'Normalizando pergunta e extraindo empresa/CNPJ', microcopy: 'Identificando a empresa e parâmetros da investigação...' },
-  { id: 'cadastre', label: 'Consultando dados cadastrais', description: 'Buscando CNPJ, CNAE, razão social, matriz/filial', microcopy: 'Cruzando dados cadastrais com sinais públicos...' },
-  { id: 'enriching', label: 'Enriquecendo fontes públicas', description: 'Consultando BrasilAPI, BCB, web search', microcopy: 'Buscando evidências em múltiplas fontes...' },
-  { id: 'sector_detection', label: 'Detectando setor', description: 'Cruzando CNAE, nome, descrição e sinais', microcopy: 'Validando se o CNAE bate com a operação real...' },
-  { id: 'playbook', label: 'Selecionando playbook', description: 'Escolhendo lente setorial adequada', microcopy: 'Selecionando a lente de análise mais precisa...' },
-  { id: 'evidence', label: 'Buscando evidências', description: 'Coletando fatos, fontes e sinais', microcopy: 'Separando fatos de hipóteses...' },
-  { id: 'competition', label: 'Mapeando concorrência', description: 'Buscando concorrentes e sinais competitivos', microcopy: 'Identificando o cenário competitivo...' },
-  { id: 'porta', label: 'Avaliando PORTA', description: 'Calculando Porte, Operação, Retorno, Tecnologia, Adoção', microcopy: 'Montando uma tese comercial acionável...' },
-  { id: 'thesis', label: 'Montando tese comercial', description: 'Gerando oportunidades, riscos e perguntas', microcopy: 'Construindo a tese comercial baseada em evidências...' },
-  { id: 'saving', label: 'Salvando histórico', description: 'Persistindo sessão, dossiê e score', microcopy: 'Salvando o histórico para você continuar depois...' },
-  { id: 'finishing', label: 'Finalizando dossiê', description: 'Organizando resposta e validando consistência', microcopy: 'Organizando o dossiê final...' },
+  { id: 'preparing', label: 'Preparando investigação', description: 'Planejando consultas e extraindo parâmetros', microcopy: 'Consultando fontes oficiais...' },
+  { id: 'cadastre', label: 'Consultando dados cadastrais', description: 'Buscando CNPJ na BrasilAPI e fontes públicas', microcopy: 'Buscando CNPJ em fonte pública...' },
+  { id: 'enriching', label: 'Pesquisando fontes', description: 'Consultando múltiplas fontes de informação', microcopy: 'Tentando fonte alternativa...' },
+  { id: 'sector_detection', label: 'Detectando setor', description: 'Cruzando evidências para classificar', microcopy: 'Validando dados encontrados...' },
+  { id: 'playbook', label: 'Selecionando playbook', description: 'Escolhendo lente setorial adequada', microcopy: 'Cruzando informações antes de responder...' },
+  { id: 'evidence', label: 'Extraindo evidências', description: 'Separando fatos, hipóteses e lacunas', microcopy: 'Verificando consistência das fontes...' },
+  { id: 'competition', label: 'Mapeando concorrência', description: 'Buscando sinais competitivos reais', microcopy: 'Reconsultando com outro provedor...' },
+  { id: 'porta', label: 'Avaliando PORTA', description: 'Calculando score com evidências por dimensão', microcopy: 'Buscando evidências suficientes para uma resposta segura...' },
+  { id: 'thesis', label: 'Montando tese comercial', description: 'Gerando análise baseada em evidências', microcopy: 'Construindo análise fundamentada...' },
+  { id: 'validating', label: 'Validando resultado', description: 'Verificando qualidade e consistência', microcopy: 'Verificando consistência das fontes...' },
+  { id: 'saving', label: 'Salvando histórico', description: 'Persistindo dossiê e score', microcopy: 'Salvando o dossiê final...' },
 ]
 
 export const WARROOM_STAGES: StageDef[] = [
@@ -125,11 +125,11 @@ export const RADAR_STAGES: StageDef[] = [
 // ============================================================
 
 const PROGRESSIVE_MESSAGES = [
-  { threshold: 8, message: 'Essa investigação está um pouco mais profunda.' },
-  { threshold: 15, message: 'Algumas fontes estão demorando, mas o Scout continua trabalhando.' },
-  { threshold: 25, message: 'Vou entregar resultado parcial se alguma fonte não responder.' },
-  { threshold: 40, message: 'Fontes externas podem estar lentas. Preparando resposta com o que já foi validado.' },
-  { threshold: 60, message: 'A investigação está levando mais tempo que o esperado. O resultado será mais completo.' },
+  { threshold: 8, message: 'Consultando fontes oficiais... a investigação é detalhada.' },
+  { threshold: 15, message: 'Algumas fontes estão demorando. Tentando fonte alternativa...' },
+  { threshold: 25, message: 'Validando dados encontrados. Aguardando resposta da fonte...' },
+  { threshold: 40, message: 'Cruzando evidências antes de responder. Buscando confirmação...' },
+  { threshold: 60, message: 'A investigação está levando mais tempo que o esperado. Verificando consistência das fontes...' },
 ]
 
 export function getProgressiveMessage(elapsedSeconds: number): string | null {
@@ -499,11 +499,9 @@ const ERROR_STATE_CONFIG: Record<string, { icon: React.ElementType; color: strin
   sector_uncertain: { icon: FileQuestion, color: 'text-amber-500' },
   docs_not_found: { icon: BookOpen, color: 'text-amber-500' },
   no_reliable_source: { icon: ShieldAlert, color: 'text-rose-500' },
-  partial_result: { icon: AlertTriangle, color: 'text-amber-500' },
+  insufficient_evidence: { icon: ShieldAlert, color: 'text-amber-500' },
   timeout: { icon: Clock, color: 'text-rose-500' },
   cancelled: { icon: X, color: 'text-slate-500' },
-  session_recovered: { icon: RefreshCw, color: 'text-emerald-500' },
-  cache_used: { icon: Database, color: 'text-amber-500' },
   unknown: { icon: AlertTriangle, color: 'text-rose-500' },
 }
 
@@ -1338,8 +1336,8 @@ export function useSSEInvestigation() {
         if (event.message) {
           setTickerItems(prev => [...prev, {
             id: `ticker-${event.stageId}-warn-${Date.now()}`,
-            message: event.message,
-            type: 'warning',
+            message: event.message as string,
+            type: 'warning' as const,
             timestamp: Date.now(),
           }])
         }
@@ -1350,15 +1348,15 @@ export function useSSEInvestigation() {
         if (event.message) {
           setTickerItems(prev => [...prev, {
             id: `ticker-${event.stageId}-fail-${Date.now()}`,
-            message: event.message,
-            type: 'error',
+            message: event.message as string,
+            type: 'error' as const,
             timestamp: Date.now(),
           }])
         }
         setError({
           type: 'api_down',
           message: event.message || 'Uma etapa falhou.',
-          action: { label: 'Continuar com dados parciais', handler: () => {} },
+          action: { label: 'Tentar novamente', handler: () => {} },
         })
         break
 

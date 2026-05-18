@@ -33,7 +33,7 @@ export async function GET() {
     const portaAverages =
       portaScores.length > 0
         ? {
-            porte: Math.round((portaScores.reduce((s, p) => s + p.total, 0) / portaScores.length) * 100) / 100,
+            porte: 0,
             operacao: 0,
             retorno: 0,
             tecnologia: 0,

@@ -69,7 +69,7 @@ interface PortaScoreData {
 }
 
 interface Evidence {
-  type: 'fact' | 'hypotesis' | 'recommendation' | 'gap'
+  type: 'fact' | 'hypothesis' | 'hypotesis' | 'recommendation' | 'gap'
   claim: string
   source: string
   confidence: 'high' | 'medium' | 'low'
@@ -160,7 +160,7 @@ const CONFIDENCE_COLORS: Record<string, string> = {
 
 // ---------- SSE Hook ----------
 
-function useSSEInvestigation() {
+function useSSEInvestigation(onInvestigationFailed?: () => void) {
   const [stageStatuses, setStageStatuses] = useState<Record<string, StageStatus>>({})
   const [currentStageId, setCurrentStageId] = useState<string | null>(null)
   const [tickerItems, setTickerItems] = useState<TickerItem[]>([])
@@ -304,7 +304,12 @@ function useSSEInvestigation() {
         break
       case 'progress_stage_failed':
         setStageStatuses(prev => ({ ...prev, [event.stageId as string]: 'failed' }))
+        // Don't complete remaining stages on failure
+        setIsLoading(false)
+        if (timerRef.current) clearInterval(timerRef.current)
         setError({ type: 'api_down', message: (event.message as string) || 'Uma etapa falhou.' })
+        // Notify parent to reload investigations
+        onInvestigationFailed?.()
         break
       case 'evidence_found':
         setTickerItems(prev => [...prev, {
@@ -340,21 +345,35 @@ function useSSEInvestigation() {
       case 'final_response_ready':
         if (event.metadata && !(event.metadata as Record<string, unknown>).error) {
           setResult(event.metadata as Record<string, unknown>)
+          // Only complete remaining stages on SUCCESS
+          setStageStatuses(prev => {
+            const updated = { ...prev }
+            SCOUT_STAGES.forEach(stage => {
+              if (updated[stage.id] !== 'completed' && updated[stage.id] !== 'failed' && updated[stage.id] !== 'warning') {
+                updated[stage.id] = 'completed'
+              }
+            })
+            return updated
+          })
         } else if ((event.metadata as Record<string, unknown>)?.error) {
-          setError({ type: 'unknown', message: ((event.metadata as Record<string, unknown>).message as string) || 'Erro na investigação' })
+          // On failure: do NOT complete stages, set error state
+          const errorMsg = ((event.metadata as Record<string, unknown>).message as string) || 'Erro na investigação'
+          setError({ type: 'api_down', message: errorMsg })
+          // Mark all pending stages as failed, not completed
+          setStageStatuses(prev => {
+            const updated = { ...prev }
+            SCOUT_STAGES.forEach(stage => {
+              if (updated[stage.id] !== 'completed' && updated[stage.id] !== 'failed') {
+                updated[stage.id] = 'failed'
+              }
+            })
+            return updated
+          })
+          // Notify parent to reload investigations
+          onInvestigationFailed?.()
         }
         setIsLoading(false)
         if (timerRef.current) clearInterval(timerRef.current)
-        // Complete all remaining stages
-        setStageStatuses(prev => {
-          const updated = { ...prev }
-          SCOUT_STAGES.forEach(stage => {
-            if (updated[stage.id] !== 'completed' && updated[stage.id] !== 'failed' && updated[stage.id] !== 'warning') {
-              updated[stage.id] = 'completed'
-            }
-          })
-          return updated
-        })
         break
     }
   }
@@ -389,7 +408,7 @@ export function ScoutView() {
     stageStatuses, currentStageId, tickerItems, sourceStatuses,
     confidence, elapsedSeconds, isCancelling, isLoading, result, error,
     startInvestigation, cancel,
-  } = useSSEInvestigation()
+  } = useSSEInvestigation(() => { loadInvestigations() })
 
   const parseJson = <T,>(jsonStr: string | null | undefined, fallback: T): T => {
     if (!jsonStr) return fallback
@@ -411,13 +430,20 @@ export function ScoutView() {
   // When SSE result arrives, update investigation list
   useEffect(() => {
     if (result && (result as Record<string, unknown>).investigation) {
-      const invData = (result as { investigation: Investigation; portaScore: PortaScoreData })
+      const invData = (result as { investigation: Investigation; portaScore: PortaScoreData; evidenceGate?: { hasMinimumEvidence: boolean; factCount: number; recommendation: string } })
       const newInvestigation: Investigation = { ...invData.investigation, portaScore: invData.portaScore }
-      setInvestigations(prev => [newInvestigation, ...prev])
-      setSelectedInvestigation(newInvestigation)
-      toast.success(`Investigação de "${newInvestigation.companyName}" concluída!`)
-      setCompanyName('')
-      setCnpj('')
+      // Only add to list and show success if investigation is truly completed
+      if (newInvestigation.status === 'completed') {
+        setInvestigations(prev => [newInvestigation, ...prev])
+        setSelectedInvestigation(newInvestigation)
+        if (invData.evidenceGate?.recommendation === 'insufficient_evidence') {
+          toast.warning(`Investigação de "${newInvestigation.companyName}" concluída com ressalvas — poucas evidências de alta confiança.`)
+        } else {
+          toast.success(`Investigação de "${newInvestigation.companyName}" concluída!`)
+        }
+        setCompanyName('')
+        setCnpj('')
+      }
     }
   }, [result])
 
@@ -489,7 +515,7 @@ export function ScoutView() {
   const qcResult = parseJson<{ passed: boolean; issues: string[] }>(selectedInvestigation?.qualityCheck, { passed: true, issues: [] })
 
   const facts = evidenceList.filter(e => e.type === 'fact')
-  const hypotheses = evidenceList.filter(e => e.type === 'hypotesis' || e.type === 'hypothesis')
+  const hypotheses = evidenceList.filter(e => e.type === 'hypothesis' || e.type === 'hypotesis')
   const recommendations = evidenceList.filter(e => e.type === 'recommendation')
   const gaps = evidenceList.filter(e => e.type === 'gap')
 
@@ -867,12 +893,23 @@ export function ScoutView() {
                           {STATUS_LABELS[inv.status] || inv.status}
                         </Badge>
                       </div>
-                      {inv.portaScore && (
+                      {inv.portaScore && inv.status === 'completed' && (
                         <div className="mt-2 flex items-center gap-2">
                           <span className="text-xs text-muted-foreground">PORTA:</span>
                           <span className={`text-sm font-bold ${inv.portaScore.total >= 6 ? 'text-emerald-600' : inv.portaScore.total >= 3 ? 'text-amber-600' : 'text-rose-600'}`}>
                             {inv.portaScore.total.toFixed(1)}
                           </span>
+                        </div>
+                      )}
+                      {inv.status === 'failed' && (
+                        <div className="mt-2 flex items-center gap-2">
+                          <Button variant="outline" size="sm" className="h-6 text-[10px]" onClick={(e) => {
+                            e.stopPropagation()
+                            setCompanyName(inv.companyName)
+                            setCnpj(inv.cnpj || '')
+                          }}>
+                            <RefreshCw className="h-3 w-3 mr-1" />Tentar novamente
+                          </Button>
                         </div>
                       )}
                       <div className="mt-2 flex items-center justify-between">

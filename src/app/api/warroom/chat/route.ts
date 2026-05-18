@@ -69,13 +69,14 @@ Você consulta a documentação oficial Senior (documentacao.senior.com.br) como
 REGRAS ESTRITAS:
 1. NUNCA afirme algo como verdade que não veio da documentação ou de fonte explícita.
 2. Se não encontrar fonte, responda que não encontrou na documentação.
-3. Se a fonte for parcial, responda com confiança média/baixa.
-4. NÃO invente nome de tela, parâmetro, campo ou rotina.
-5. NÃO invente link.
-6. NÃO prometa funcionalidade que não está na documentação.
-7. Quando a documentação for técnica, resuma em linguagem simples para vendedor.
-8. Quando houver risco de promessa indevida, ALERTe o vendedor.
-9. Sempre tente dar ao vendedor algo ÚTIL para usar na conversa com o cliente.
+3. NÃO invente nome de tela, parâmetro, campo ou rotina.
+4. NÃO invente link.
+5. NÃO prometa funcionalidade que não está na documentação.
+6. Quando a documentação for técnica, resuma em linguagem simples para vendedor.
+7. Quando houver risco de promessa indevida, ALERTe o vendedor.
+8. Sempre tente dar ao vendedor algo ÚTIL para usar na conversa com o cliente.
+9. NÃO use frase como "resultado parcial" ou "continuar com dados parciais".
+10. Se a documentação não tiver a resposta, diga claramente: "Não encontrei referência oficial suficiente na documentação Senior."
 
 FORMATO DA RESPOSTA (sempre use estes 7 blocos):
 
@@ -181,7 +182,6 @@ export async function POST(request: NextRequest) {
       url: string;
       title?: string;
       snippet?: string;
-      [key: string]: unknown;
     }
 
     let searchResults: SearchHit[] = [];
@@ -191,11 +191,15 @@ export async function POST(request: NextRequest) {
         num: 10,
       });
       if (Array.isArray(searchResponse)) {
-        searchResults = searchResponse;
+        searchResults = (searchResponse as unknown as Array<Record<string, unknown>>).map(r => ({
+          url: String(r.url || ''), title: String(r.title || ''), snippet: String(r.snippet || ''),
+        })).filter(r => r.url);
       } else if (searchResponse && typeof searchResponse === 'object') {
         const resp = searchResponse as Record<string, unknown>;
-        if (Array.isArray(resp.results)) searchResults = resp.results as SearchHit[];
-        else if (Array.isArray(resp.items)) searchResults = resp.items as SearchHit[];
+        const items = (Array.isArray(resp.results) ? resp.results : Array.isArray(resp.items) ? resp.items : []) as unknown as Array<Record<string, unknown>>;
+        searchResults = items.map(r => ({
+          url: String(r.url || ''), title: String(r.title || ''), snippet: String(r.snippet || ''),
+        })).filter(r => r.url);
       }
     } catch {
       searchResults = [];
@@ -229,7 +233,7 @@ export async function POST(request: NextRequest) {
           let isFullContent = false;
 
           if (pageData && typeof pageData === 'object') {
-            const pd = pageData as Record<string, unknown>;
+            const pd = pageData as unknown as Record<string, unknown>;
             const dataObj = (pd.data as Record<string, unknown>) || pd;
             const rawContent = (dataObj.content as string) || (dataObj.text as string) || (dataObj.markdown as string) || (dataObj.html as string) || '';
             extractedContent = rawContent.includes('<') ? stripHtml(rawContent) : rawContent;
@@ -336,13 +340,13 @@ export async function POST(request: NextRequest) {
       data: { sessionId: session.id, role: 'assistant', content: answer, intent, confidence, product: keyTerms.product || null, module: keyTerms.module || null },
     });
 
-    const sourceRecords = [];
+    const sourceRecords: Array<{ id: string; title: string; url: string; snippet: string; relevance: number }> = [];
     for (let i = 0; i < pageContents.length; i++) {
       const page = pageContents[i];
       const source = await db.warRoomSource.create({
         data: { messageId: assistantMessage.id, title: page.title, url: page.url, snippet: page.content.slice(0, 500), relevance: 1 - i * 0.15 },
       });
-      sourceRecords.push(source);
+      sourceRecords.push({ id: source.id, title: source.title, url: source.url, snippet: source.snippet, relevance: source.relevance });
     }
 
     // Step 10: Return structured response

@@ -321,3 +321,80 @@ Key mapping:
 - War Room and Radar loading are estimated (not real SSE)
 - Could add more CRM fields from investigation (contact info, etc.)
 - Could add "retomar investigação" (resume) feature
+
+---
+Task ID: 12
+Agent: Main Orchestrator
+Task: Failure Integrity + Real Brain Pass — Remove mock, fake data, partial results; build real Research Engine; fix failure integrity across all modules
+
+Work Log:
+- Audited entire codebase: found 0 mock data, 0 hardcoded scores, 0 fake completions, but found fake pipeline stages (BrasilAPI/BCB enrichment was theater), partial_result in ErrorState, "Vou entregar resultado parcial" progressive delay message
+- Built Research Engine library (src/lib/research-engine.ts) with: QueryPlanner, MultiProviderSearch (BrasilAPI CNPJ + web_search + fallback search), retry with exponential backoff, source validation, evidence gate
+- Rewrote Scout API (src/app/api/scout/investigate/route.ts) with: Research Engine integration, real BrasilAPI CNPJ lookup, real competition search, evidence gate (blocks analysis if insufficient facts), PORTA score only calculated when facts exist, state machine: investigating → completed/failed (never false success), markInvestigationFailed() ensures failed investigations never become completed
+- Removed partial_result from ErrorState type, replaced with insufficient_evidence
+- Removed "Vou entregar resultado parcial se alguma fonte não responder" from progressive delay messages, replaced with honest effort language ("Consultando fontes oficiais...", "Tentando fonte alternativa...", "Cruzando evidências antes de responder...")
+- Removed fake pipeline stages: "BrasilAPI: consulta indireta via web search" → replaced with real BrasilAPI call; "BCB: não aplicável" → removed; competition stage → real web search for competitors
+- Fixed Scout frontend: SSE failure now marks pending stages as failed (not completed), failed investigations reload list with correct status, PORTA score only shown for completed investigations, failed investigation cards show "Tentar novamente" button
+- Fixed War Room API: removed "resultado parcial" language from system prompt, added rule "Se a documentação não tiver a resposta, diga claramente", fixed TypeScript errors (SearchFunctionResultItem casting, PageReaderFunctionResult casting, sourceRecords typing)
+- Fixed Dashboard stats bug: porte average was using p.total instead of 0 placeholder (was overwritten anyway, but confusing)
+- Fixed investigation-loader.tsx: removed "Continuar com dados parciais" action label, replaced with "Tentar novamente"; fixed TickerItem message typing (string | undefined → string with as const)
+- Normalized LLM output: "mistura" → "mista", "agro_industria" → "agroindustria" in classification
+- Added robust JSON extraction for PORTA score: tries direct parse, then finds outermost {…} in text
+- All TypeScript errors in src/ fixed (0 errors remaining)
+- ESLint passes clean
+- Tested via agent-browser: Scout SSE streaming works, all tabs load, no 502 errors, all APIs return 200
+
+Stage Summary:
+- **Research Engine** (src/lib/research-engine.ts): New library with QueryPlanner, SearchProvider (web_search + BrasilAPI CNPJ + fallback), withRetry (exponential backoff), validateSource, evaluateEvidence (evidence gate)
+- **Scout API**: Complete rewrite — uses Research Engine for real multi-provider search, BrasilAPI for real CNPJ data, evidence gate blocks analysis without facts, PORTA only calculated with evidence, failed investigations never marked as completed
+- **Frontend**: Failed SSE events mark stages as failed (not completed), failed cards show retry button, PORTA only shown for completed investigations
+- **War Room**: Removed partial result language, added honest failure rules, fixed TS errors
+- **Dashboard**: Fixed porte average bug
+- **Key principle**: Product prefers NOT to respond than to respond beautifully and wrong. Error → honest message + actionable next step. No mock, no fake, no partial.
+
+Causas de erro identificadas e corrigidas:
+1. 502 root cause: SSE pipeline errors caught and marked as "failed" (not "completed"). Frontend no longer auto-completes stages on failure
+2. False success: Investigation was being created as "investigating" at start, and only the catch block was updating to "failed". Now the pipeline has explicit markInvestigationFailed() calls at every critical failure point
+3. Fake stages: BrasilAPI/BCB/Competition were theater → replaced with real API calls
+4. Partial result promise: Removed "Vou entregar resultado parcial" message and partial_result error type
+5. PORTA without evidence: Now only created when there are facts; returns null otherwise
+6. TypeScript errors in warroom/chat/route.ts: Fixed SearchFunctionResultItem and PageReaderFunctionResult casting issues
+
+Provedores de pesquisa usados:
+- web_search (ZAI SDK) — primary search provider
+- BrasilAPI (https://brasilapi.com.br/api/cnpj/v1/{cnpj}) — real CNPJ lookup
+- web_search fallback — alternative query formulations when primary search returns few results
+- DuckDuckGo: Not directly accessible as API, but fallback search uses alternative query strategies
+
+Retries e timeouts:
+- web_search: 2 retries, 30s timeout, exponential backoff (1s→2s→4s)
+- BrasilAPI: 1 retry, 15s timeout
+- page_reader: 15s timeout, no retry (non-critical enrichment)
+- LLM calls: 1 retry, 60s timeout
+
+Mocks removidos:
+- "BrasilAPI: consulta indireta via web search" → real BrasilAPI call
+- "BCB: não aplicável nesta etapa" → removed entirely
+- "Sinais competitivos: X lacunas podem conter dados competitivos" → real competitive web search
+- "Vou entregar resultado parcial se alguma fonte não responder" → removed
+- partial_result ErrorState type → replaced with insufficient_evidence
+- "Continuar com dados parciais" action → replaced with "Tentar novamente"
+
+Telas conectadas a dados reais:
+- Scout: Real web_search + BrasilAPI + LLM classification + evidence gate
+- War Room: Real documentacao.senior.com.br search + page_reader
+- Radar: Real web_search + LLM categorization
+- CRM: Prisma DB only (no mock, empty state when no data)
+- Dashboard: Prisma DB aggregation (no fake numbers)
+
+Estados vazios honestos criados:
+- Dashboard: Shows "—" for PORTA score when no data, "Nenhum dado disponível ainda" when empty
+- CRM: "Nenhuma conta no CRM" with guidance
+- Radar: "Nenhuma entrada no radar" with guidance
+- Scout: ErrorStateDisplay with actionable retry button
+
+Limitações restantes:
+- War Room/Radar loading is estimated (not real SSE) — could add SSE in future
+- DuckDuckGo not directly accessible as separate API — fallback uses alternative query formulations via web_search
+- Some LLM responses may still vary in JSON format (mitigated with robust extraction)
+- No authentication — any user can access any data
